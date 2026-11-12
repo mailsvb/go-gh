@@ -2,6 +2,7 @@ package gh
 
 import (
 	"context"
+	"time"
 
 	"github.com/shurcooL/githubv4"
 )
@@ -20,6 +21,8 @@ type Repo struct {
 	Private       bool   `json:"private"`
 	Archived      bool   `json:"archived"`
 	Admin         bool   `json:"admin"` // viewer can manage webhooks
+	// PushedAt is the time of the last push to any branch (zero if never).
+	PushedAt time.Time `json:"pushedAt"`
 }
 
 type repoNode struct {
@@ -30,6 +33,7 @@ type repoNode struct {
 	URL               githubv4.URI
 	IsPrivate         bool
 	IsArchived        bool
+	PushedAt          *githubv4.DateTime
 	ViewerPermission  githubv4.RepositoryPermission
 	Owner             struct {
 		Login        string
@@ -82,6 +86,9 @@ func (c *Client) Repos(ctx context.Context) ([]Repo, error) {
 				Private:       n.IsPrivate,
 				Archived:      n.IsArchived,
 				Admin:         n.ViewerPermission == githubv4.RepositoryPermissionAdmin,
+			}
+			if n.PushedAt != nil {
+				r.PushedAt = n.PushedAt.Time
 			}
 			if n.OpenGraphImageURL.URL != nil {
 				r.ImageURL = n.OpenGraphImageURL.String()

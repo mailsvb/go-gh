@@ -42,8 +42,9 @@ func (p *pushCache) put(k string, v pushInfo) {
 // EnrichPushes fills in the commit count and head commit message of Events
 // API pushes, which GitHub no longer includes there, so they read exactly
 // like the same push received as a webhook. It calls
-// GET /repos/{repo}/compare/{before}...{head} once per push range. Events that
-// can't be enriched (e.g. no access) are returned unchanged.
+// GET /repos/{repo}/compare/{before}...{head} once per push range, which needs
+// the "Contents: read" permission. Events that can't be enriched (e.g. no
+// access) are returned unchanged.
 func (c *Client) EnrichPushes(ctx context.Context, evts []events.Event, concurrency int) []events.Event {
 	var idx []int
 	for i, e := range evts {
@@ -58,11 +59,12 @@ func (c *Client) EnrichPushes(ctx context.Context, evts []events.Event, concurre
 			return &v
 		}
 		owner, repo, ok := strings.Cut(e.Repo, "/")
-		if !ok {
+		if !ok || c.noContents.has(owner) {
 			return nil
 		}
 		cmp, _, err := c.REST.Repositories.CompareCommits(ctx, owner, repo, e.Before, e.Head, &github.ListOptions{PerPage: 100})
 		if err != nil {
+			c.contentsDenied(owner, err)
 			return nil
 		}
 		v := pushInfo{commits: cmp.GetTotalCommits()}

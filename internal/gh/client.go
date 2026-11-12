@@ -26,6 +26,8 @@ type Client struct {
 	GraphQL *githubv4.Client
 	http    *http.Client
 	pushes  pushCache
+	// noContents holds accounts whose installation lacks "Contents: read".
+	noContents ownerSet
 }
 
 // New creates a Client that authenticates with tokens from src (which may

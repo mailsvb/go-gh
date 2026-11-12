@@ -2,6 +2,7 @@ package core
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -172,5 +173,27 @@ func TestInScopeAndNewest(t *testing.T) {
 	}
 	if got := newest(evts, 2); len(got) != 2 || got[0].Key != "d" || got[1].Key != "b" {
 		t.Fatalf("newest(2) = %+v", got)
+	}
+}
+
+func TestActivityRepos(t *testing.T) {
+	at := func(h int) time.Time { return time.Date(2026, 11, 12, h, 0, 0, 0, time.UTC) }
+	repos := []gh.Repo{
+		{NameWithOwner: "acme/old", Owner: "acme", Name: "old", PushedAt: at(1)},
+		{NameWithOwner: "acme/new", Owner: "acme", Name: "new", PushedAt: at(9)},
+		{NameWithOwner: "acme/empty", Owner: "acme", Name: "empty"}, // never pushed
+		{NameWithOwner: "mona/x", Owner: "mona", Name: "x", PushedAt: at(5)},
+		{NameWithOwner: "mona/unhooked", Owner: "mona", Name: "unhooked", PushedAt: at(10)},
+		{NameWithOwner: "other/y", Owner: "other", Name: "y", PushedAt: at(11)},
+	}
+	targets := []gh.HookTarget{{Org: "ACME"}, {Owner: "mona", Repo: "x"}}
+
+	got := activityRepos(targets, repos, 10)
+	want := []gh.HookTarget{{Owner: "acme", Repo: "new"}, {Owner: "mona", Repo: "x"}, {Owner: "acme", Repo: "old"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("activityRepos = %v, want %v", got, want)
+	}
+	if got := activityRepos(targets, repos, 2); !slices.Equal(got, want[:2]) {
+		t.Errorf("capped = %v", got)
 	}
 }

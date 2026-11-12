@@ -1,22 +1,28 @@
 // Package services exposes the backend to the frontend via Wails bindings.
-// Each exported method becomes a typed TypeScript function.
+// Each exported method becomes a typed TypeScript function. The services are
+// grouped by feature and stay thin wrappers around core.Core.
 package services
 
 import (
 	"go-gh/internal/auth"
 	"go-gh/internal/core"
-	"go-gh/internal/events"
-	"go-gh/internal/gh"
 )
 
-// AuthService handles login state.
+// AppService gives the UI its initial data and triggers reloads. Later
+// changes arrive as events (see the core.Evt* constants).
+type AppService struct{ Core *core.Core }
+
+// Snapshot returns the state, repositories and event history in one call.
+func (s *AppService) Snapshot() core.Snapshot { return s.Core.Snapshot() }
+
+// Refresh reloads organizations, repositories and the event history.
+func (s *AppService) Refresh() { s.Core.Refresh() }
+
+// AuthService handles the GitHub session.
 type AuthService struct{ Core *core.Core }
 
-// State returns the current app state.
-func (s *AuthService) State() core.State { return s.Core.State() }
-
-// StartLogin starts the GitHub device flow and returns the code to enter.
-func (s *AuthService) StartLogin() (auth.DeviceCode, error) { return s.Core.StartLogin() }
+// Login starts the GitHub device flow and returns the code to enter.
+func (s *AuthService) Login() (auth.DeviceCode, error) { return s.Core.StartLogin() }
 
 // CancelLogin aborts a pending login.
 func (s *AuthService) CancelLogin() { s.Core.CancelLogin() }
@@ -27,44 +33,38 @@ func (s *AuthService) Logout() { s.Core.Logout() }
 // Retry tries to activate the stored session again.
 func (s *AuthService) Retry() { s.Core.Retry() }
 
-// RepoService lists repositories.
-type RepoService struct{ Core *core.Core }
+// NgrokService manages the ngrok authtoken. It works before login too; the
+// tunnel connects once a session is active.
+type NgrokService struct{ Core *core.Core }
 
-// Repos returns the repositories of the logged-in user.
-func (s *RepoService) Repos() []gh.Repo { return s.Core.Repos() }
+// SetToken saves the ngrok authtoken in the keychain and connects.
+func (s *NgrokService) SetToken(token string) error { return s.Core.SetNgrokToken(token) }
 
-// Refresh reloads organizations, repositories and the event history.
-func (s *RepoService) Refresh() { s.Core.Refresh() }
+// ClearToken removes the ngrok authtoken and stops receiving webhooks.
+func (s *NgrokService) ClearToken() error { return s.Core.ClearNgrokToken() }
 
-// EventService exposes the in-memory event history.
-type EventService struct{ Core *core.Core }
-
-// Recent returns up to 100 events, newest first.
-func (s *EventService) Recent() []events.Event { return s.Core.Events() }
-
-// SettingsService changes ngrok and webhook settings.
-type SettingsService struct{ Core *core.Core }
-
-// SetNgrokToken saves the ngrok authtoken in the keychain and connects.
-func (s *SettingsService) SetNgrokToken(token string) error { return s.Core.SetNgrokToken(token) }
-
-// ClearNgrokToken removes the ngrok authtoken and stops receiving webhooks.
-func (s *SettingsService) ClearNgrokToken() error { return s.Core.ClearNgrokToken() }
+// WebhookService chooses where webhooks are created.
+type WebhookService struct{ Core *core.Core }
 
 // SetOrgEnabled enables or disables the organization webhook for org.
-func (s *SettingsService) SetOrgEnabled(org string, enabled bool) error {
+func (s *WebhookService) SetOrgEnabled(org string, enabled bool) error {
 	return s.Core.SetOrgEnabled(org, enabled)
 }
 
-// SetHookPersonalRepos enables or disables per-repository webhooks.
-func (s *SettingsService) SetHookPersonalRepos(on bool) error {
+// SetPersonalRepos enables or disables per-repository webhooks.
+func (s *WebhookService) SetPersonalRepos(on bool) error {
 	return s.Core.SetHookPersonalRepos(on)
 }
 
-// CheckNotifications re-reads the OS notification permission.
-func (s *SettingsService) CheckNotifications() core.NotificationState {
-	return s.Core.CheckNotifications()
-}
+// NotifyService manages OS notifications.
+type NotifyService struct{ Core *core.Core }
 
-// TestNotification shows a sample notification.
-func (s *SettingsService) TestNotification() { s.Core.TestNotification() }
+// Check re-reads the OS notification permission.
+func (s *NotifyService) Check() core.NotificationState { return s.Core.CheckNotifications() }
+
+// Enable asks the OS for permission (a prompt appears only if the user was
+// never asked) and returns the resulting state.
+func (s *NotifyService) Enable() core.NotificationState { return s.Core.EnableNotifications() }
+
+// Test shows a sample notification.
+func (s *NotifyService) Test() { s.Core.TestNotification() }

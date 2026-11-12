@@ -1,11 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import EventPanel from "./lib/EventPanel.svelte";
+  import CodeWindow from "./lib/CodeWindow.svelte";
   import Header from "./lib/Header.svelte";
   import Login from "./lib/Login.svelte";
+  import NotificationBanner from "./lib/NotificationBanner.svelte";
   import RepoList from "./lib/RepoList.svelte";
   import Settings from "./lib/Settings.svelte";
   import { app, init } from "./lib/store.svelte";
+
+  // The same bundle serves the small login-code window (see main.go).
+  const codeView = new URLSearchParams(location.search).get("view") === "code";
 
   let tab = $state<"repos" | "events">("repos");
   let showSettings = $state(false);
@@ -26,34 +31,39 @@
   });
 </script>
 
-<main>
-  {#if !ready}
-    <Login />
-  {:else if showSettings}
-    <Settings onClose={() => (showSettings = false)} />
-  {:else}
-    <Header onSettings={() => (showSettings = true)} />
-    <nav>
-      <button class:active={tab === "repos"} onclick={() => (tab = "repos")}>
-        Repositories <span class="count">{app.repos.length}</span>
-      </button>
-      <button class:active={tab === "events"} onclick={openEvents}>
-        Notifications
-        {#if app.unread > 0}<span class="count new">{app.unread}</span>{:else}<span class="count">{app.events.length}</span>{/if}
-      </button>
-    </nav>
-    {#if app.state?.error}
-      <p class="error banner">{app.state.error}</p>
-    {/if}
-    <section class="content">
-      {#if tab === "repos"}
-        <RepoList />
-      {:else}
-        <EventPanel />
+{#if codeView}
+  <CodeWindow />
+{:else}
+  <main>
+    {#if !ready}
+      <Login />
+    {:else if showSettings}
+      <Settings onClose={() => (showSettings = false)} />
+    {:else}
+      <Header onSettings={() => (showSettings = true)} />
+      <nav>
+        <button class:active={tab === "repos"} onclick={() => (tab = "repos")}>
+          Repositories <span class="count">{app.repos.length}</span>
+        </button>
+        <button class:active={tab === "events"} onclick={openEvents}>
+          Notifications
+          {#if app.unread > 0}<span class="count new">{app.unread}</span>{:else}<span class="count">{app.events.length}</span>{/if}
+        </button>
+      </nav>
+      <NotificationBanner />
+      {#if app.state?.error}
+        <p class="error banner">{app.state.error}</p>
       {/if}
-    </section>
-  {/if}
-</main>
+      <section class="content">
+        {#if tab === "repos"}
+          <RepoList />
+        {:else}
+          <EventPanel />
+        {/if}
+      </section>
+    {/if}
+  </main>
+{/if}
 
 <style>
   main {

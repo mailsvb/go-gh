@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-github/v93/github"
 	"golang.org/x/oauth2"
@@ -230,6 +232,7 @@ func TestReposGraphQL(t *testing.T) {
 		fmt.Fprint(w, `{"data":{"viewer":{"repositories":{"nodes":[
 			{"nameWithOwner":"acme/api","name":"api","description":"API","openGraphImageUrl":"https://img/1",
 			 "url":"https://github.com/acme/api","isPrivate":true,"isArchived":false,"viewerPermission":"ADMIN",
+			 "pushedAt":"2026-11-12T15:03:34Z",
 			 "owner":{"login":"acme","__typename":"Organization","avatarUrl":"https://av/acme","databaseId":42}},
 			{"nameWithOwner":"mona/x","name":"x","description":"","openGraphImageUrl":"https://img/2",
 			 "url":"https://github.com/mona/x","isPrivate":false,"isArchived":false,"viewerPermission":"WRITE",
@@ -252,7 +255,10 @@ func TestReposGraphQL(t *testing.T) {
 	if r := repos[0]; r.Owner != "acme" || !r.OwnerIsOrg || r.OwnerID != 42 || r.OwnerAvatar != "https://av/acme" || !r.Admin || r.ImageURL != "https://img/1" {
 		t.Errorf("org repo = %+v", r)
 	}
-	if r := repos[1]; r.OwnerIsOrg || r.OwnerID != 7 || r.Admin {
+	if want := time.Date(2026, 11, 12, 15, 3, 34, 0, time.UTC); !repos[0].PushedAt.Equal(want) {
+		t.Errorf("pushedAt = %v, want %v", repos[0].PushedAt, want)
+	}
+	if r := repos[1]; r.OwnerIsOrg || r.OwnerID != 7 || r.Admin || !r.PushedAt.IsZero() {
 		t.Errorf("user repo = %+v", r)
 	}
 }
@@ -290,5 +296,101 @@ func TestEnrichPushes(t *testing.T) {
 	}
 	if in[0].Commits != 0 {
 		t.Fatal("input slice was modified")
+	}
+}
+
+// activityJSON is a real /repos/{o}/{r}/activity response (shortened SHAs).
+const activityJSON = `[
+ {"id":6,"activity_type":"push","ref":"refs/heads/main","before":"6ef7efb","after":"706d9cf",
+  "timestamp":"2026-11-12T15:03:34Z","actor":{"login":"mona","avatar_url":"https://av/mona"}},
+ {"id":5,"activity_type":"branch_deletion","ref":"refs/heads/feature","before":"c5fc689",
+  "after":"0000000000000000000000000000000000000000","timestamp":"2026-11-12T13:54:55Z","actor":{"login":"hubot"}},
+ {"id":4,"activity_type":"pr_merge","ref":"refs/heads/main","before":"d458b83","after":"6ef7efb",
+  "timestamp":"2026-11-12T13:54:52Z","actor":{"login":"hubot"}},
+ {"id":3,"activity_type":"branch_creation","ref":"refs/heads/feature",
+  "before":"0000000000000000000000000000000000000000","after":"c5fc689","timestamp":"2026-11-12T13:52:55Z","actor":{"login":"hubot"}},
+ {"id":2,"activity_type":"force_push","ref":"refs/heads/dev","before":"aaa","after":"bbb",
+  "timestamp":"2026-11-12T12:00:00Z","actor":{"login":"mona"}},
+ {"id":1,"activity_type":"branch_creation","ref":"refs/tags/v1.0",
+  "before":"0000000000000000000000000000000000000000","after":"ccc","timestamp":"2026-11-12T11:00:00Z","actor":{"login":"mona"}}
+]`
+
+func TestMapActivities(t *testing.T) {
+	var acts []*github.RepositoryActivity
+	if err := json.Unmarshal([]byte(activityJSON), &acts); err != nil {
+		t.Fatal(err)
+	}
+	got := MapActivities("octo/app", acts)
+	want := []struct{ key, title string }{
+		{"push:octo/app:refs/heads/main:706d9cf", "mona pushed to main"},
+		{"push:octo/app:refs/heads/main:6ef7efb", "hubot pushed to main"}, // like the webhook push of a merge
+		{"create:octo/app:branch:feature", "hubot created branch feature"},
+		{"push:octo/app:refs/heads/dev:bbb", "mona pushed to dev"},
+		{"create:octo/app:tag:v1.0", "mona created tag v1.0"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d events: %+v", len(got), got)
+	}
+	for i, w := range want {
+		if got[i].Key != w.key || got[i].Title != w.title || got[i].Source != events.SourceBackfill {
+			t.Errorf("event %d = %q %q %s, want %q %q", i, got[i].Key, got[i].Title, got[i].Source, w.key, w.title)
+		}
+	}
+	if e := got[0]; e.Before != "6ef7efb" || e.Head != "706d9cf" || !e.NeedsCommits() || e.Avatar != "https://av/mona" ||
+		!e.Time.Equal(time.Date(2026, 11, 12, 15, 3, 34, 0, time.UTC)) {
+		t.Errorf("push = %+v", e)
+	}
+}
+
+func TestBackfillReadsActivity(t *testing.T) {
+	var deniedCalls, compareCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /users/mona/events", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[]`) })
+	mux.HandleFunc("GET /repos/octo/app/activity", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("per_page") != "100" {
+			t.Errorf("per_page = %q", r.URL.Query().Get("per_page"))
+		}
+		fmt.Fprint(w, activityJSON)
+	})
+	// An installation without "Contents: read".
+	denied := func(w http.ResponseWriter, r *http.Request) {
+		deniedCalls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message":"Resource not accessible by integration"}`)
+	}
+	mux.HandleFunc("GET /repos/Locked/a/activity", denied)
+	mux.HandleFunc("GET /repos/Locked/b/activity", denied)
+	mux.HandleFunc("GET /repos/locked/c/compare/", func(w http.ResponseWriter, r *http.Request) {
+		compareCalls.Add(1)
+		denied(w, r)
+	})
+	mux.HandleFunc("GET /repos/broken/x/activity", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+	})
+	c := testClient(t, mux)
+	evts, errs := c.Backfill(context.Background(), BackfillSources{
+		Login: "mona",
+		Activity: []HookTarget{
+			{Owner: "octo", Repo: "app"}, {Owner: "Locked", Repo: "a"}, {Owner: "Locked", Repo: "b"}, {Owner: "broken", Repo: "x"},
+		},
+	}, 1)
+	if len(evts) != 5 {
+		t.Errorf("events = %d, want 5", len(evts))
+	}
+	// The permission problem is not an error; other failures are.
+	if len(errs) != 1 || errs["activity:broken/x"] == nil {
+		t.Errorf("errs = %v", errs)
+	}
+	if got := c.NoContentsAccess(); !slices.Equal(got, []string{"locked"}) {
+		t.Errorf("NoContentsAccess = %v", got)
+	}
+	// With concurrency 1 the second repo of the denied account is skipped.
+	if n := deniedCalls.Load(); n != 1 {
+		t.Errorf("denied account was asked %d times, want 1", n)
+	}
+	// Commit lookups for that account are skipped too.
+	out := c.EnrichPushes(context.Background(), []events.Event{{Kind: events.KindPush, Repo: "locked/c", Before: "a", Head: "b"}}, 1)
+	if compareCalls.Load() != 0 || out[0].Commits != 0 {
+		t.Errorf("compare calls = %d, commits = %d", compareCalls.Load(), out[0].Commits)
 	}
 }

@@ -1,5 +1,5 @@
 import { Events } from "@wailsio/runtime";
-import { AuthService, EventService, RepoService } from "../../bindings/go-gh/internal/services";
+import { AppService } from "../../bindings/go-gh/internal/services";
 import type { State } from "../../bindings/go-gh/internal/core";
 import type { Event } from "../../bindings/go-gh/internal/events";
 import type { Repo } from "../../bindings/go-gh/internal/gh";
@@ -10,7 +10,9 @@ export const app = $state<{
   repos: Repo[];
   events: Event[];
   unread: number;
-}>({ state: null, repos: [], events: [], unread: 0 });
+  /** The "notifications are off" banner was dismissed for this session. */
+  notifyBannerHidden: boolean;
+}>({ state: null, repos: [], events: [], unread: 0, notifyBannerHidden: false });
 
 const MAX_EVENTS = 100;
 
@@ -35,14 +37,11 @@ export async function init(): Promise<void> {
     app.unread++;
   });
 
-  const [state, repos, events] = await Promise.all([
-    AuthService.State(),
-    RepoService.Repos(),
-    EventService.Recent(),
-  ]);
-  app.state ??= state;
-  if (app.repos.length === 0) app.repos = repos ?? [];
-  if (app.events.length === 0) app.events = events ?? [];
+  // Change events that arrived while the snapshot was loading are newer.
+  const snap = await AppService.Snapshot();
+  app.state ??= snap.state;
+  if (app.repos.length === 0) app.repos = snap.repos ?? [];
+  if (app.events.length === 0) app.events = snap.events ?? [];
 }
 
 export function relativeTime(iso: string): string {

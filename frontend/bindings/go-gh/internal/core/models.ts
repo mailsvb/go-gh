@@ -6,6 +6,9 @@
 import * as auth$0 from "../auth/models.js";
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
+import * as events$0 from "../events/models.js";
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore: Unused imports
 import * as gh$0 from "../gh/models.js";
 
 /**
@@ -128,6 +131,15 @@ export enum Phase {
 };
 
 /**
+ * Snapshot is the complete UI data at one point in time.
+ */
+export interface Snapshot {
+    "state": State;
+    "repos": gh$0.Repo[] | null;
+    "events": events$0.Event[] | null;
+}
+
+/**
  * State is everything the UI needs to render chrome and status.
  */
 export interface State {
@@ -143,6 +155,13 @@ export interface State {
     "orgs": OrgState[] | null;
     "reposLoading": boolean;
     "backfillErrors": string[] | null;
+
+    /**
+     * NoContentsAccess lists accounts (lowercase logins) whose go-gh
+     * installation lacks "Contents: read": their pushes come only from the
+     * Events API, which lags and misses pull request merges.
+     */
+    "noContentsAccess": string[] | null;
     "notifications": NotificationState;
     "error": string;
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Browser } from "@wailsio/runtime";
-  import { AuthService, RepoService } from "../../bindings/go-gh/internal/services";
+  import { AppService, AuthService } from "../../bindings/go-gh/internal/services";
   import Icon from "./Icon.svelte";
   import { app } from "./store.svelte";
 
@@ -32,7 +32,7 @@
   {/if}
   <span class="spacer"></span>
   <span class="dot {tunnel}" title={dotTitle}></span>
-  <button class="icon" title="Refresh" onclick={() => RepoService.Refresh()}><Icon name="refresh" /></button>
+  <button class="icon" title="Refresh" onclick={() => AppService.Refresh()}><Icon name="refresh" /></button>
   <button class="icon" title="Settings" onclick={onSettings}><Icon name="gear" /></button>
   <button class="icon" title="Log out" onclick={() => AuthService.Logout()}><Icon name="logout" /></button>
 </header>

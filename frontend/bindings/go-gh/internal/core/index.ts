@@ -10,6 +10,7 @@ export type {
     HookSummary,
     NotificationState,
     OrgState,
+    Snapshot,
     State,
     TunnelState
 } from "./models.js";

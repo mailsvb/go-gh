@@ -49,5 +49,11 @@
     <path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" />
   {:else if name === "external"}
     <path d="M9.5 2.5h4v4M13.5 2.5 7.5 8.5M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3" />
+  {:else if name === "close"}
+    <path d="M4 4l8 8M12 4l-8 8" />
+  {:else if name === "bell-off"}
+    <!-- bell with a slash -->
+    <path d="M4.5 11.5V7.5a3.5 3.5 0 0 1 5.6-2.8M11.5 7.5v4M3 11.5h10M6.8 13.5h2.4" />
+    <path d="M2.5 2.5l11 11" />
   {/if}
 </svg>

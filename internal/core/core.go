@@ -19,8 +19,6 @@ import (
 	"go-gh/internal/events"
 	"go-gh/internal/gh"
 	"go-gh/internal/secrets"
-	"go-gh/internal/tunnel"
-	"go-gh/internal/webhook"
 )
 
 // Event names emitted to the frontend.
@@ -34,6 +32,9 @@ const (
 const (
 	apiConcurrency   = 8
 	maxBackfillRepos = 50
+	// maxActivityRepos bounds the per-repository activity requests on each
+	// refresh; the most recently pushed repositories are read.
+	maxActivityRepos = 30
 	tunnelRetry      = 30 * time.Second
 )
 
@@ -99,22 +100,33 @@ type NotificationState struct {
 
 // State is everything the UI needs to render chrome and status.
 type State struct {
-	Phase             Phase             `json:"phase"`
-	User              *gh.User          `json:"user"`
-	App               AppState          `json:"app"`
-	DeviceCode        *auth.DeviceCode  `json:"deviceCode"`
-	ClientIDSet       bool              `json:"clientIdSet"`
-	NgrokSet          bool              `json:"ngrokSet"`
-	HookPersonalRepos bool              `json:"hookPersonalRepos"`
-	Tunnel            TunnelState       `json:"tunnel"`
-	Hooks             HookSummary       `json:"hooks"`
-	Orgs              []OrgState        `json:"orgs"`
-	ReposLoading      bool              `json:"reposLoading"`
-	BackfillErrors    []string          `json:"backfillErrors"`
-	Notifications     NotificationState `json:"notifications"`
-	Error             string            `json:"error"`
+	Phase             Phase            `json:"phase"`
+	User              *gh.User         `json:"user"`
+	App               AppState         `json:"app"`
+	DeviceCode        *auth.DeviceCode `json:"deviceCode"`
+	ClientIDSet       bool             `json:"clientIdSet"`
+	NgrokSet          bool             `json:"ngrokSet"`
+	HookPersonalRepos bool             `json:"hookPersonalRepos"`
+	Tunnel            TunnelState      `json:"tunnel"`
+	Hooks             HookSummary      `json:"hooks"`
+	Orgs              []OrgState       `json:"orgs"`
+	ReposLoading      bool             `json:"reposLoading"`
+	BackfillErrors    []string         `json:"backfillErrors"`
+	// NoContentsAccess lists accounts (lowercase logins) whose go-gh
+	// installation lacks "Contents: read": their pushes come only from the
+	// Events API, which lags and misses pull request merges.
+	NoContentsAccess []string          `json:"noContentsAccess"`
+	Notifications    NotificationState `json:"notifications"`
+	Error            string            `json:"error"`
 	// CanRetry is set when a stored session exists but GitHub was unreachable.
 	CanRetry bool `json:"canRetry"`
+}
+
+// Snapshot is the complete UI data at one point in time.
+type Snapshot struct {
+	State  State          `json:"state"`
+	Repos  []gh.Repo      `json:"repos"`
+	Events []events.Event `json:"events"`
 }
 
 // Notifier shows OS notifications for live events.
@@ -122,6 +134,9 @@ type Notifier interface {
 	Notify(e events.Event)
 	// Allowed reports whether the OS lets the app show notifications.
 	Allowed() (bool, error)
+	// Request asks the OS for permission. The OS prompts only if the user
+	// was never asked; otherwise it reports the current setting.
+	Request() (bool, error)
 }
 
 // Emitter sends an event to the frontend.
@@ -136,6 +151,8 @@ type Options struct {
 	Notifier Notifier
 	Emit     Emitter
 	Log      *slog.Logger
+	// StartTunnel connects the webhook tunnel; nil means ngrok.
+	StartTunnel TunnelStarter
 }
 
 // Core is the application backend.
@@ -152,7 +169,9 @@ type Core struct {
 	// are then attempted everywhere instead of being filtered.
 	installsKnown bool
 	lastRefresh   time.Time
-	tun           *tunnel.Tunnel
+	run           *tunnelRun // current tunnel loop, nil when no token
+	tun           Tunnel     // current online tunnel
+	retryDelay    time.Duration
 	session       context.Context // cancelled on logout/shutdown
 	cancel        context.CancelFunc
 	login         context.CancelFunc
@@ -167,7 +186,10 @@ func New(o Options) *Core {
 	if o.Emit == nil {
 		o.Emit = func(string, any) {}
 	}
-	c := &Core{opts: o, log: o.Log, store: events.NewStore(events.DefaultCapacity)}
+	if o.StartTunnel == nil {
+		o.StartTunnel = startNgrok
+	}
+	c := &Core{opts: o, log: o.Log, store: events.NewStore(events.DefaultCapacity), retryDelay: tunnelRetry}
 	c.state = State{
 		Phase:       PhaseStarting,
 		ClientIDSet: o.ClientID != "",
@@ -190,6 +212,7 @@ func (c *Core) snapshotLocked() State {
 	s.Hooks.Results = slices.Clone(s.Hooks.Results)
 	s.Hooks.Skipped = slices.Clone(s.Hooks.Skipped)
 	s.BackfillErrors = slices.Clone(s.BackfillErrors)
+	s.NoContentsAccess = slices.Clone(s.NoContentsAccess)
 	cfg := c.opts.Config.Get()
 	s.HookPersonalRepos = cfg.HookPersonalRepos
 	return s
@@ -203,6 +226,18 @@ func (c *Core) update(fn func(*State)) {
 	c.opts.Emit(EvtState, s)
 }
 
+// Snapshot returns state, repositories and history together, so the UI can
+// initialize without racing the change events.
+func (c *Core) Snapshot() Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Snapshot{
+		State:  c.snapshotLocked(),
+		Repos:  slices.Clone(c.repos),
+		Events: c.store.List(),
+	}
+}
+
 // Events returns the in-memory history, newest first.
 func (c *Core) Events() []events.Event { return c.store.List() }
 
@@ -213,11 +248,16 @@ func (c *Core) Repos() []gh.Repo {
 	return slices.Clone(c.repos)
 }
 
-// Start loads the stored token and, if present, activates the session.
+// Start connects ngrok if an authtoken is stored and activates the stored
+// GitHub session, if any. Both are independent of each other.
 func (c *Core) Start() {
-	ngrokTok, _ := c.opts.Secrets.Get(secrets.NgrokToken)
+	c.connectTunnel()
+	c.resume()
+}
+
+// resume loads the stored GitHub token and, if present, activates the session.
+func (c *Core) resume() {
 	stored, err := c.opts.Secrets.Get(secrets.GitHubToken)
-	c.update(func(s *State) { s.NgrokSet = ngrokTok != "" })
 	if err != nil || stored == "" {
 		if err != nil {
 			c.log.Warn("reading token from keychain", "err", err)
@@ -285,9 +325,12 @@ func (c *Core) CancelLogin() {
 	c.update(func(s *State) { s.Phase, s.DeviceCode = PhaseLoggedOut, nil })
 }
 
-// Logout deactivates webhooks, stops the tunnel and forgets the token.
+// Logout deactivates webhooks and forgets the GitHub token. The ngrok
+// tunnel stays connected.
 func (c *Core) Logout() {
-	c.teardown()
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	c.teardown(ctx)
+	done()
 	_ = c.opts.Secrets.Delete(secrets.GitHubToken)
 	c.store.Clear()
 	c.mu.Lock()
@@ -299,32 +342,32 @@ func (c *Core) Logout() {
 	c.update(func(s *State) {
 		s.Phase, s.User, s.Orgs = PhaseLoggedOut, nil, nil
 		s.App = c0AppState(c.opts.AppSlug)
-		s.Hooks, s.BackfillErrors, s.Error = HookSummary{}, nil, ""
-		s.Tunnel = TunnelState{Status: "off"}
+		s.Hooks, s.BackfillErrors, s.NoContentsAccess, s.Error = HookSummary{}, nil, nil, ""
 	})
 }
 
-// Shutdown deactivates webhooks (bounded by a short timeout) and closes the tunnel.
-func (c *Core) Shutdown() { c.teardown() }
+// Shutdown deactivates webhooks and closes the tunnel, bounded by a short timeout.
+func (c *Core) Shutdown() {
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	c.teardown(ctx)
+	c.stopTunnel(ctx)
+}
 
-func (c *Core) teardown() {
+// teardown ends the session and deactivates its webhooks.
+func (c *Core) teardown(ctx context.Context) {
 	c.mu.Lock()
-	cancel, client, tun := c.cancel, c.client, c.tun
-	c.cancel, c.tun = nil, nil
+	cancel, client := c.cancel, c.client
+	c.cancel = nil
 	results := slices.Clone(c.state.Hooks.Results)
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
-	defer done()
 	if client != nil {
 		c.hookRuns.Lock()
 		client.DeactivateHooks(ctx, results, apiConcurrency)
 		c.hookRuns.Unlock()
-	}
-	if tun != nil {
-		_ = tun.Close(ctx)
 	}
 }
 
@@ -444,7 +487,7 @@ func (c *Core) refresh(ctx context.Context, client *gh.Client, user gh.User) {
 	})
 
 	c.backfill(ctx, client, user, orgStates, repos)
-	c.ensureTunnelAndHooks(ctx, client)
+	c.applyHooks()
 }
 
 // orgSources are the places organizations are learned from. With a GitHub
@@ -567,6 +610,7 @@ func (c *Core) backfill(ctx context.Context, client *gh.Client, user gh.User, or
 		}
 		src.Repos = append(src.Repos, t)
 	}
+	src.Activity = activityRepos(targets, repos, maxActivityRepos)
 	evts, errs := client.Backfill(ctx, src, apiConcurrency)
 	if ctx.Err() != nil {
 		return
@@ -584,7 +628,12 @@ func (c *Core) backfill(ctx context.Context, client *gh.Client, user gh.User, or
 	c.store.Add(evts...)
 	c.opts.Emit(EvtEventsSet, c.store.List())
 
+	noContents := client.NoContentsAccess()
+	if len(noContents) > 0 {
+		c.log.Info("history limited: go-gh lacks Contents: read", "accounts", noContents)
+	}
 	c.update(func(s *State) {
+		s.NoContentsAccess = noContents
 		s.BackfillErrors = nil
 		for name, err := range errs {
 			s.BackfillErrors = append(s.BackfillErrors, err.Error())
@@ -604,56 +653,6 @@ func (c *Core) backfill(ctx context.Context, client *gh.Client, user gh.User, or
 
 func (c *Core) setOrgProblem(o *OrgState, err error) {
 	o.Problem, o.SSOURL = gh.ClassifyAccess(err)
-}
-
-// ensureTunnelAndHooks starts ngrok (if configured) and points our webhooks at it.
-func (c *Core) ensureTunnelAndHooks(ctx context.Context, client *gh.Client) {
-	ngrokTok, _ := c.opts.Secrets.Get(secrets.NgrokToken)
-	if ngrokTok == "" {
-		c.update(func(s *State) { s.NgrokSet, s.Tunnel = false, TunnelState{Status: "off"} })
-		return
-	}
-	secret, err := secrets.EnsureWebhookSecret(c.opts.Secrets)
-	if err != nil {
-		c.update(func(s *State) { s.Tunnel = TunnelState{Status: "error", Error: "webhook secret: " + err.Error()} })
-		return
-	}
-	cfg := c.opts.Config.Get()
-
-	c.mu.Lock()
-	tun := c.tun
-	c.mu.Unlock()
-	if tun == nil {
-		c.update(func(s *State) { s.NgrokSet, s.Tunnel = true, TunnelState{Status: "connecting"} })
-		h := &webhook.Handler{
-			Path:    gh.HookPath(cfg.InstallID),
-			Secret:  []byte(secret),
-			OnEvent: c.onWebhookEvent,
-			Log:     c.log,
-		}
-		// The tunnel lives as long as the session (ctx); tunnel.Start applies
-		// its own connect timeout.
-		tun, err = tunnel.Start(ctx, ngrokTok, h)
-		if err != nil {
-			c.log.Error("ngrok tunnel failed to start", "err", err)
-			c.update(func(s *State) { s.Tunnel = TunnelState{Status: "error", Error: err.Error()} })
-			c.retryTunnel(ctx, client)
-			return
-		}
-		c.mu.Lock()
-		if ctx.Err() != nil {
-			c.mu.Unlock()
-			_ = tun.Close(context.Background())
-			return
-		}
-		c.tun = tun
-		c.mu.Unlock()
-		go c.watchTunnel(ctx, client, tun)
-		c.log.Info("ngrok tunnel online", "url", tun.URL())
-		c.update(func(s *State) { s.Tunnel = TunnelState{Status: "online", URL: tun.URL()} })
-	}
-
-	c.ensureHooks(ctx, client, gh.HookSpec{InstallID: cfg.InstallID, PublicURL: tun.URL(), Secret: secret})
 }
 
 func (c *Core) ensureHooks(ctx context.Context, client *gh.Client, spec gh.HookSpec) {
@@ -731,36 +730,6 @@ func (c *Core) ensureHooks(ctx context.Context, client *gh.Client, spec gh.HookS
 	})
 }
 
-func (c *Core) watchTunnel(ctx context.Context, client *gh.Client, tun *tunnel.Tunnel) {
-	select {
-	case <-ctx.Done():
-		return
-	case err := <-tun.Done():
-		c.mu.Lock()
-		if c.tun == tun {
-			c.tun = nil
-		}
-		c.mu.Unlock()
-		msg := "tunnel closed"
-		if err != nil {
-			msg = err.Error()
-		}
-		c.log.Error("ngrok tunnel stopped", "err", msg)
-		c.update(func(s *State) { s.Tunnel = TunnelState{Status: "error", Error: msg} })
-		c.retryTunnel(ctx, client)
-	}
-}
-
-func (c *Core) retryTunnel(ctx context.Context, client *gh.Client) {
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-time.After(tunnelRetry):
-			c.ensureTunnelAndHooks(ctx, client)
-		}
-	}()
-}
-
 func (c *Core) onWebhookEvent(e events.Event) {
 	added := c.store.Add(e)
 	for _, ev := range added {
@@ -768,55 +737,6 @@ func (c *Core) onWebhookEvent(e events.Event) {
 		if c.opts.Notifier != nil {
 			c.opts.Notifier.Notify(ev)
 		}
-	}
-}
-
-// SetNgrokToken stores the ngrok authtoken and (re)starts the tunnel.
-func (c *Core) SetNgrokToken(tok string) error {
-	tok = strings.TrimSpace(tok)
-	if tok == "" {
-		return c.ClearNgrokToken()
-	}
-	if err := c.opts.Secrets.Set(secrets.NgrokToken, tok); err != nil {
-		return err
-	}
-	c.restartTunnel()
-	return nil
-}
-
-// ClearNgrokToken removes the ngrok authtoken, deactivates hooks and stops the tunnel.
-func (c *Core) ClearNgrokToken() error {
-	if err := c.opts.Secrets.Delete(secrets.NgrokToken); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	tun, client := c.tun, c.client
-	c.tun = nil
-	results := slices.Clone(c.state.Hooks.Results)
-	c.mu.Unlock()
-	ctx, done := context.WithTimeout(context.Background(), 10*time.Second)
-	defer done()
-	if client != nil {
-		client.DeactivateHooks(ctx, results, apiConcurrency)
-	}
-	if tun != nil {
-		_ = tun.Close(ctx)
-	}
-	c.update(func(s *State) { s.NgrokSet, s.Tunnel, s.Hooks = false, TunnelState{Status: "off"}, HookSummary{} })
-	return nil
-}
-
-func (c *Core) restartTunnel() {
-	c.mu.Lock()
-	tun, client, ctx := c.tun, c.client, c.session
-	c.tun = nil
-	c.mu.Unlock()
-	if tun != nil {
-		_ = tun.Close(context.Background())
-	}
-	c.update(func(s *State) { s.NgrokSet = true })
-	if client != nil && ctx != nil && ctx.Err() == nil {
-		go c.ensureTunnelAndHooks(ctx, client)
 	}
 }
 
@@ -852,21 +772,6 @@ func (c *Core) SetHookPersonalRepos(on bool) error {
 	return nil
 }
 
-func (c *Core) reapplyHooks() {
-	c.mu.Lock()
-	ctx, client, tun := c.session, c.client, c.tun
-	c.mu.Unlock()
-	if client == nil || tun == nil || ctx == nil || ctx.Err() != nil {
-		return
-	}
-	secret, err := secrets.EnsureWebhookSecret(c.opts.Secrets)
-	if err != nil {
-		return
-	}
-	cfg := c.opts.Config.Get()
-	go c.ensureHooks(ctx, client, gh.HookSpec{InstallID: cfg.InstallID, PublicURL: tun.URL(), Secret: secret})
-}
-
 // RefreshIfStale refreshes when the last refresh is older than maxAge, e.g.
 // when the window opens after the user installed the app on GitHub.
 func (c *Core) RefreshIfStale(maxAge time.Duration) {
@@ -883,7 +788,7 @@ func (c *Core) OnWake() { c.Refresh() }
 
 // Retry re-reads the stored token and tries to activate the session again
 // (e.g. after GitHub was unreachable at startup).
-func (c *Core) Retry() { c.Start() }
+func (c *Core) Retry() { c.resume() }
 
 func c0AppState(slug string) AppState {
 	return AppState{
@@ -917,6 +822,19 @@ func (c *Core) CheckNotifications() NotificationState {
 	}
 	c.update(func(s *State) { s.Notifications = st })
 	return st
+}
+
+// EnableNotifications asks the OS for notification permission and returns
+// the resulting state. If the user denied it before, no prompt appears and
+// the state stays "not allowed"; the UI then opens the system settings.
+func (c *Core) EnableNotifications() NotificationState {
+	if c.opts.Notifier == nil {
+		return NotificationState{}
+	}
+	if _, err := c.opts.Notifier.Request(); err != nil {
+		c.log.Warn("requesting notification permission", "err", err)
+	}
+	return c.CheckNotifications()
 }
 
 // TestNotification shows a sample notification.
@@ -977,6 +895,35 @@ func hookTargets(in targetInput) (targets []gh.HookTarget, skipped []string) {
 		targets = append(targets, gh.HookTarget{Owner: r.Owner, Repo: r.Name})
 	}
 	return targets, skipped
+}
+
+// activityRepos returns up to n repositories covered by targets (repo
+// targets, and the repositories of org targets) that were pushed to, most
+// recently pushed first.
+func activityRepos(targets []gh.HookTarget, repos []gh.Repo, n int) []gh.HookTarget {
+	orgs, direct := map[string]bool{}, map[string]bool{}
+	for _, t := range targets {
+		if t.Org != "" {
+			orgs[strings.ToLower(t.Org)] = true
+		} else {
+			direct[strings.ToLower(t.Owner+"/"+t.Repo)] = true
+		}
+	}
+	var in []gh.Repo
+	for _, r := range repos {
+		if r.PushedAt.IsZero() {
+			continue
+		}
+		if orgs[strings.ToLower(r.Owner)] || direct[strings.ToLower(r.NameWithOwner)] {
+			in = append(in, r)
+		}
+	}
+	slices.SortStableFunc(in, func(a, b gh.Repo) int { return b.PushedAt.Compare(a.PushedAt) })
+	out := make([]gh.HookTarget, 0, min(n, len(in)))
+	for _, r := range in[:min(n, len(in))] {
+		out = append(out, gh.HookTarget{Owner: r.Owner, Repo: r.Name})
+	}
+	return out
 }
 
 // inScope keeps events from repositories that get webhooks: repo targets

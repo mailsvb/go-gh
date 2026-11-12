@@ -75,6 +75,11 @@ export interface Repo {
      * viewer can manage webhooks
      */
     "admin": boolean;
+
+    /**
+     * PushedAt is the time of the last push to any branch (zero if never).
+     */
+    "pushedAt": string;
 }
 
 /**

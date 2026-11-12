@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -79,10 +80,11 @@ func main() {
 		Description: "GitHub events in your tray",
 		Services: []application.Service{
 			application.NewService(ns),
+			application.NewService(&services.AppService{Core: c}),
 			application.NewService(&services.AuthService{Core: c}),
-			application.NewService(&services.RepoService{Core: c}),
-			application.NewService(&services.EventService{Core: c}),
-			application.NewService(&services.SettingsService{Core: c}),
+			application.NewService(&services.NgrokService{Core: c}),
+			application.NewService(&services.WebhookService{Core: c}),
+			application.NewService(&services.NotifyService{Core: c}),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),
@@ -112,14 +114,40 @@ func main() {
 		},
 	})
 	// Pick up changes made on GitHub (e.g. a new installation) when the
-	// popup opens, at most once a minute.
+	// popup opens, at most once a minute, and changes to the notification
+	// permission made in the system settings.
 	window.OnWindowEvent(events.Common.WindowShow, func(*application.WindowEvent) {
+		c.CheckNotifications()
 		c.RefreshIfStale(time.Minute)
 	})
 	// Closing the popup only hides it; the app keeps running in the tray.
 	window.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
 		window.Hide()
 		e.Cancel()
+	})
+
+	// While the device flow runs, the popup is hidden and this small window
+	// shows the code to enter on GitHub.
+	codeWin := app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Name:             "code",
+		Title:            "go-gh login",
+		Width:            320,
+		Height:           200,
+		Frameless:        true,
+		AlwaysOnTop:      true,
+		Hidden:           true,
+		DisableResize:    true,
+		InitialPosition:  application.WindowCentered,
+		BackgroundColour: application.NewRGB(13, 17, 23),
+		URL:              "/?view=code",
+		Windows: application.WindowsWindow{
+			HiddenOnTaskbar: true,
+		},
+	})
+	// Closing the code window cancels the login.
+	codeWin.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
+		e.Cancel()
+		c.CancelLogin()
 	})
 
 	tray := app.SystemTray.New()
@@ -141,13 +169,37 @@ func main() {
 	tray.SetMenu(menu)
 	tray.AttachWindow(window).WindowOffset(5)
 
-	// Keep the tray status line in sync with the backend state.
+	// Keep the tray status line in sync with the backend state, and switch
+	// between the popup and the code window when a login starts or ends.
+	var (
+		phaseMu   sync.Mutex
+		prevPhase core.Phase
+	)
 	app.Event.On(core.EvtState, func(e *application.CustomEvent) {
-		if s, ok := e.Data.(core.State); ok {
-			label := statusLabel(s)
-			status.SetLabel(label)
-			menu.Update()
-			tray.SetTooltip("go-gh — " + label)
+		s, ok := e.Data.(core.State)
+		if !ok {
+			return
+		}
+		label := statusLabel(s)
+		status.SetLabel(label)
+		menu.Update()
+		tray.SetTooltip("go-gh — " + label)
+
+		phaseMu.Lock()
+		prev := prevPhase
+		prevPhase = s.Phase
+		phaseMu.Unlock()
+		switch {
+		case s.Phase == core.PhaseLoggingIn && prev != core.PhaseLoggingIn:
+			window.Hide()
+			codeWin.Center()
+			codeWin.Show()
+			codeWin.Focus()
+		case s.Phase != core.PhaseLoggingIn && prev == core.PhaseLoggingIn:
+			codeWin.Hide()
+			// Show the result: the logged-in view, or the error after a
+			// cancelled or failed login.
+			tray.ShowWindow()
 		}
 	})
 
@@ -162,11 +214,8 @@ func main() {
 	})
 
 	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
-		// Shows the OS permission prompt the first time; afterwards it only
-		// reports the current setting.
-		if ok, err := ns.RequestNotificationAuthorization(); err != nil || !ok {
-			slog.Warn("notifications not authorized", "err", err)
-		}
+		// Only check the permission; the UI offers to enable notifications
+		// (which shows the OS prompt) when they are off.
 		c.CheckNotifications()
 		c.Start()
 	})
@@ -209,6 +258,8 @@ type notifier struct {
 }
 
 func (n notifier) Allowed() (bool, error) { return n.ns.CheckNotificationAuthorization() }
+
+func (n notifier) Request() (bool, error) { return n.ns.RequestNotificationAuthorization() }
 
 func (n notifier) Notify(e appevents.Event) {
 	body := e.Title

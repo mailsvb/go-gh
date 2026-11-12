@@ -1,58 +1,40 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { Browser, System } from "@wailsio/runtime";
-  import { SettingsService } from "../../bindings/go-gh/internal/services";
+  import { NotifyService, WebhookService } from "../../bindings/go-gh/internal/services";
   import Icon from "./Icon.svelte";
+  import NgrokSettings from "./NgrokSettings.svelte";
   import { app } from "./store.svelte";
+  import { openNotificationSettings } from "./system";
 
   let { onClose }: { onClose: () => void } = $props();
 
-  let token = $state("");
-  let saving = $state(false);
-  let err = $state("");
   let testSent = $state(false);
 
   // The user may have changed the OS setting since the last check.
   onMount(() => {
-    SettingsService.CheckNotifications();
+    NotifyService.Check();
   });
 
-  function openNotificationSettings() {
-    if (System.IsMac()) {
-      Browser.OpenURL("x-apple.systempreferences:com.apple.Notifications-Settings.extension");
-    } else if (System.IsWindows()) {
-      Browser.OpenURL("ms-settings:notifications");
-    }
+  async function enableNotifications() {
+    const st = await NotifyService.Enable();
+    if (!st.allowed) openNotificationSettings();
   }
 
   async function testNotification() {
-    await SettingsService.TestNotification();
+    await NotifyService.Test();
     testSent = true;
   }
 
   const s = $derived(app.state);
   const failed = $derived((s?.hooks.results ?? []).filter((r) => !r.ok));
 
-  async function save() {
-    saving = true;
-    err = "";
-    try {
-      await SettingsService.SetNgrokToken(token);
-      token = "";
-    } catch (e) {
-      err = String(e);
-    } finally {
-      saving = false;
-    }
-  }
-
-  async function clear() {
-    err = "";
-    try {
-      await SettingsService.ClearNgrokToken();
-    } catch (e) {
-      err = String(e);
-    }
+  // Installation settings of an account (where pending permission requests
+  // are approved), or "" when go-gh doesn't know it.
+  function installSettingsUrl(account: string): string {
+    if (!s) return "";
+    if (s.user && s.user.login.toLowerCase() === account) return s.app.installUrl;
+    return s.orgs?.find((o) => o.login.toLowerCase() === account)?.installUrl ?? "";
   }
 
   function problemText(p: string): string {
@@ -102,34 +84,7 @@
     </section>
 
     <section>
-      <h2>ngrok</h2>
-      {#if s?.ngrokSet}
-        <p>
-          Status: <strong class={s.tunnel.status}>{s.tunnel.status}</strong>
-          {#if s.tunnel.url}<br /><span class="muted mono">{s.tunnel.url}</span>{/if}
-          {#if s.tunnel.error}<br /><span class="error">{s.tunnel.error}</span>{/if}
-        </p>
-      {:else}
-        <p class="muted">
-          go-gh receives webhooks through an ngrok tunnel. Paste your authtoken from the
-          <button class="link" onclick={() => Browser.OpenURL("https://dashboard.ngrok.com/get-started/your-authtoken")}
-            >ngrok dashboard</button
-          >. It is stored in your system keychain.
-        </p>
-      {/if}
-      <form
-        onsubmit={(e) => {
-          e.preventDefault();
-          save();
-        }}
-      >
-        <input type="password" placeholder={s?.ngrokSet ? "Replace authtoken" : "ngrok authtoken"} bind:value={token} />
-        <button class="primary" type="submit" disabled={saving || !token.trim()}>Save</button>
-      </form>
-      {#if s?.ngrokSet}
-        <button onclick={clear}>Remove token and stop webhooks</button>
-      {/if}
-      {#if err}<p class="error">{err}</p>{/if}
+      <NgrokSettings />
     </section>
 
     <section>
@@ -150,8 +105,8 @@
       {/if}
       <div class="row">
         {#if s?.notifications.checked && !s.notifications.allowed}
-          <button class="primary" onclick={openNotificationSettings}>Open notification settings</button>
-          <button onclick={() => SettingsService.CheckNotifications()}>Check again</button>
+          <button class="primary" onclick={enableNotifications}>Enable notifications</button>
+          <button onclick={() => NotifyService.Check()}>Check again</button>
         {/if}
         <button onclick={testNotification}>Send test notification</button>
       </div>
@@ -177,7 +132,7 @@
         <input
           type="checkbox"
           checked={s?.hookPersonalRepos ?? true}
-          onchange={(e) => SettingsService.SetHookPersonalRepos(e.currentTarget.checked)}
+          onchange={(e) => WebhookService.SetPersonalRepos(e.currentTarget.checked)}
         />
         Add webhooks to repositories I administer outside of hooked organizations
       </label>
@@ -241,7 +196,7 @@
                     type="checkbox"
                     title="Organization webhook"
                     checked={o.enabled}
-                    onchange={(e) => SettingsService.SetOrgEnabled(o.login, e.currentTarget.checked)}
+                    onchange={(e) => WebhookService.SetOrgEnabled(o.login, e.currentTarget.checked)}
                   />
                 {/if}
               </div>
@@ -256,15 +211,33 @@
       {/if}
     </section>
 
-    {#if s?.backfillErrors?.length}
+    {#if s?.backfillErrors?.length || s?.noContentsAccess?.length}
       <section>
         <h2>History</h2>
-        <details>
-          <summary class="muted">{s.backfillErrors.length} event feeds could not be read</summary>
-          <ul class="fails">
-            {#each s.backfillErrors as e}<li class="muted small">{e}</li>{/each}
-          </ul>
-        </details>
+        {#if s.noContentsAccess?.length}
+          <p class="warn small">
+            Synced pushes can be missing or hours late, and pull request merges don't show, for these accounts. Approve
+            go-gh's “Contents: read” permission in their installation settings for complete history:
+          </p>
+          <div class="row">
+            {#each s.noContentsAccess as account (account)}
+              {@const url = installSettingsUrl(account)}
+              {#if url}
+                <button onclick={() => Browser.OpenURL(url)}>{account}</button>
+              {:else}
+                <span class="muted small">{account}</span>
+              {/if}
+            {/each}
+          </div>
+        {/if}
+        {#if s.backfillErrors?.length}
+          <details>
+            <summary class="muted">{s.backfillErrors.length} event feeds could not be read</summary>
+            <ul class="fails">
+              {#each s.backfillErrors as e}<li class="muted small">{e}</li>{/each}
+            </ul>
+          </details>
+        {/if}
       </section>
     {/if}
 
@@ -317,22 +290,11 @@
   p {
     margin: 0;
   }
-  form {
-    display: flex;
-    gap: 6px;
-  }
-  .mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12px;
-  }
-  .online {
-    color: var(--ok);
-  }
-  .connecting {
-    color: var(--warn);
-  }
   .error {
     color: var(--danger);
+  }
+  .warn {
+    color: var(--warn);
   }
   .small {
     font-size: 12px;
