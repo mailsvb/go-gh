@@ -1,0 +1,17 @@
+{
+	"fixed": {
+		"file_version": "0.1.0",
+		"product_version": "0.1.0"
+	},
+	"info": {
+		"0409": {
+			"FileVersion": "0.1.0",
+			"ProductVersion": "0.1.0",
+			"CompanyName": "go-gh",
+			"FileDescription": "GitHub events in your tray",
+			"LegalCopyright": "© 2026 go-gh",
+			"ProductName": "go-gh",
+			"Comments": "This is a comment"
+		}
+	}
+}
