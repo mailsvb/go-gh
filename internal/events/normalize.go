@@ -33,26 +33,36 @@ func FromPayload(payload any, c Context) (Event, bool) {
 	return Event{}, false
 }
 
+// zeroSHA is what GitHub sends as "before" for a new ref and as the head
+// of a deleted ref.
+const zeroSHA = "0000000000000000000000000000000000000000"
+
+// fromPush maps webhook pushes and Events API pushes with the same rules.
+// The Events API only carries ref, before and head (no commits, no created
+// flag), so everything is derived from those; the commit count and message
+// are filled in later with SetCommits (from webhook commits or the Compare
+// API), which keeps both sources identical.
 func fromPush(p *github.PushEvent, c Context) (Event, bool) {
 	ref := p.GetRef()
-	if p.GetDeleted() || strings.HasPrefix(ref, "refs/tags/") {
-		// Tag pushes are reported by the CreateEvent for the tag.
-		return Event{}, false
+	before := p.GetBefore()
+	head := p.GetAfter()
+	if head == "" {
+		head = p.GetHead()
 	}
-	if p.GetCreated() && len(p.Commits) == 0 {
-		// A new branch without new commits is reported by its CreateEvent.
+	switch {
+	case strings.HasPrefix(ref, "refs/tags/"):
+		return Event{}, false // reported by the CreateEvent for the tag
+	case p.GetDeleted() || head == zeroSHA:
+		return Event{}, false // branch deletion
+	case p.GetCreated() || before == zeroSHA:
+		return Event{}, false // new branch: reported by its CreateEvent
+	case !strings.HasPrefix(ref, "refs/heads/") || head == "":
 		return Event{}, false
 	}
 
 	repo := c.Repo
-	repoURL := "https://github.com/" + repo
 	if r := p.GetRepo(); r != nil && r.GetFullName() != "" {
 		repo = r.GetFullName()
-		repoURL = r.GetHTMLURL()
-	}
-	head := p.GetAfter()
-	if head == "" {
-		head = p.GetHead()
 	}
 	actor, avatar := c.Actor, c.Avatar
 	if s := p.GetSender(); s != nil {
@@ -62,39 +72,56 @@ func fromPush(p *github.PushEvent, c Context) (Event, bool) {
 		actor = p.GetPusher().GetName()
 	}
 
-	n := len(p.Commits)
-	if n == 0 {
-		n = p.GetSize()
+	link := "https://github.com/" + repo + "/commit/" + head
+	if before != "" {
+		link = fmt.Sprintf("https://github.com/%s/compare/%s...%s", repo, short(before), short(head))
 	}
-	branch := strings.TrimPrefix(ref, "refs/heads/")
-	title := fmt.Sprintf("%s pushed to %s", actor, branch)
-	if n > 0 {
-		title = fmt.Sprintf("%s pushed %d commit%s to %s", actor, n, plural(n), branch)
+	e := Event{
+		Key:    fmt.Sprintf("push:%s:%s:%s", repo, ref, head),
+		Kind:   KindPush,
+		Repo:   repo,
+		Ref:    strings.TrimPrefix(ref, "refs/heads/"),
+		Actor:  actor,
+		Avatar: avatar,
+		URL:    link,
+		Time:   orNow(c.Time),
+		Source: c.Source,
+		Before: before,
+		Head:   head,
 	}
-	detail := ""
+	msg := ""
 	if hc := p.GetHeadCommit(); hc != nil {
-		detail = firstLine(hc.GetMessage())
+		msg = hc.GetMessage()
 	} else if len(p.Commits) > 0 {
-		detail = firstLine(p.Commits[len(p.Commits)-1].GetMessage())
+		msg = p.Commits[len(p.Commits)-1].GetMessage()
 	}
-	link := p.GetCompare()
-	if link == "" && head != "" {
-		link = repoURL + "/commit/" + head
+	e.SetCommits(len(p.Commits), msg)
+	return e, true
+}
+
+// SetCommits sets the commit count and head commit message of a push and
+// rebuilds its title, e.g. "mona pushed 2 commits to main".
+func (e *Event) SetCommits(n int, headMessage string) {
+	e.Commits = n
+	e.Detail = firstLine(headMessage)
+	if n > 0 {
+		e.Title = fmt.Sprintf("%s pushed %d commit%s to %s", e.Actor, n, plural(n), e.Ref)
+	} else {
+		e.Title = fmt.Sprintf("%s pushed to %s", e.Actor, e.Ref)
 	}
-	return Event{
-		Key:     fmt.Sprintf("push:%s:%s:%s", repo, ref, head),
-		Kind:    KindPush,
-		Repo:    repo,
-		Ref:     branch,
-		Actor:   actor,
-		Avatar:  avatar,
-		Title:   title,
-		Detail:  detail,
-		URL:     link,
-		Time:    orNow(c.Time),
-		Source:  c.Source,
-		Commits: n,
-	}, true
+}
+
+// NeedsCommits reports whether a push still lacks its commit details (Events
+// API pushes before enrichment).
+func (e Event) NeedsCommits() bool {
+	return e.Kind == KindPush && e.Commits == 0 && e.Before != "" && e.Head != ""
+}
+
+func short(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func fromCreate(p *github.CreateEvent, c Context) (Event, bool) {

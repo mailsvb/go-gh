@@ -3,8 +3,10 @@ package core
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go-gh/internal/config"
+	"go-gh/internal/events"
 	"go-gh/internal/gh"
 	"go-gh/internal/secrets"
 )
@@ -151,5 +153,24 @@ func TestInstallStateFindsOrgsWithoutMembership(t *testing.T) {
 	if o := got["repo-org"]; o.AvatarURL != "a30" ||
 		o.InstallURL != "https://github.com/apps/go-gh/installations/new/permissions?target_id=30" {
 		t.Errorf("repo-org = %+v", o)
+	}
+}
+
+func TestInScopeAndNewest(t *testing.T) {
+	at := func(s int) time.Time { return time.Unix(int64(s), 0) }
+	evts := []events.Event{
+		{Key: "a", Repo: "mona/app", Time: at(1)},
+		{Key: "b", Repo: "Acme/api", Time: at(3)},   // org target, case-insensitive
+		{Key: "c", Repo: "circuit/x", Time: at(2)},  // no webhook: dropped
+		{Key: "b", Repo: "acme/api", Time: at(3)},   // duplicate
+		{Key: "d", Repo: "mona/other", Time: at(4)}, // repo without webhook: dropped
+	}
+	targets := []gh.HookTarget{{Org: "acme"}, {Owner: "mona", Repo: "app"}}
+	got := newest(inScope(evts, targets), 10)
+	if len(got) != 2 || got[0].Key != "b" || got[1].Key != "a" {
+		t.Fatalf("got %+v", got)
+	}
+	if got := newest(evts, 2); len(got) != 2 || got[0].Key != "d" || got[1].Key != "b" {
+		t.Fatalf("newest(2) = %+v", got)
 	}
 }

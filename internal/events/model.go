@@ -38,6 +38,10 @@ type Event struct {
 	Time    time.Time `json:"time"`
 	Source  Source    `json:"source"`
 	Commits int       `json:"commits"`
+	// Before and Head are the push's commit range (pushes only); the
+	// frontend doesn't need them.
+	Before string `json:"-"`
+	Head   string `json:"-"`
 }
 
 // Short returns the notification headline, e.g. "octo/repo · tag".

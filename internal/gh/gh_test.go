@@ -13,6 +13,8 @@ import (
 
 	"github.com/google/go-github/v93/github"
 	"golang.org/x/oauth2"
+
+	"go-gh/internal/events"
 )
 
 func testClient(t *testing.T, h http.Handler) *Client {
@@ -252,5 +254,41 @@ func TestReposGraphQL(t *testing.T) {
 	}
 	if r := repos[1]; r.OwnerIsOrg || r.OwnerID != 7 || r.Admin {
 		t.Errorf("user repo = %+v", r)
+	}
+}
+
+func TestEnrichPushes(t *testing.T) {
+	var calls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/octo/app/compare/aaa...bbb", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `{"total_commits":2,"commits":[{"sha":"x","commit":{"message":"first"}},{"sha":"bbb","commit":{"message":"second\n\nbody"}}]}`)
+	})
+	mux.HandleFunc("GET /repos/octo/gone/compare/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"message":"Not Found"}`)
+	})
+	c := testClient(t, mux)
+
+	push := func(repo, before, head string) events.Event {
+		e, _ := events.FromPayload(&github.PushEvent{Ref: new("refs/heads/main"), Before: new(before), Head: new(head)},
+			events.Context{Source: events.SourceBackfill, Repo: repo, Actor: "mona"})
+		return e
+	}
+	in := []events.Event{push("octo/app", "aaa", "bbb"), push("octo/gone", "ccc", "ddd"), {Key: "create:x", Kind: events.KindTag}}
+	for range 2 { // the second run is served from the cache
+		out := c.EnrichPushes(context.Background(), in, 4)
+		if out[0].Title != "mona pushed 2 commits to main" || out[0].Detail != "second" || out[0].Commits != 2 {
+			t.Fatalf("enriched = %+v", out[0])
+		}
+		if out[1].Title != "mona pushed to main" || out[2].Key != "create:x" {
+			t.Fatalf("unchanged = %+v / %+v", out[1], out[2])
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("compare called %d times, want 1 (cached)", calls.Load())
+	}
+	if in[0].Commits != 0 {
+		t.Fatal("input slice was modified")
 	}
 }

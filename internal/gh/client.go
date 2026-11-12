@@ -25,6 +25,7 @@ type Client struct {
 	REST    *github.Client
 	GraphQL *githubv4.Client
 	http    *http.Client
+	pushes  pushCache
 }
 
 // New creates a Client that authenticates with tokens from src (which may

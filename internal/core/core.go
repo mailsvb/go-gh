@@ -538,22 +538,46 @@ func (c *Core) installState(user gh.User, src orgSources) (AppState, []OrgState)
 
 // backfill rebuilds the history from the Events API.
 func (c *Core) backfill(ctx context.Context, client *gh.Client, user gh.User, orgs []OrgState, repos []gh.Repo) {
+	// Read exactly the repositories and organizations that get webhooks, so
+	// the synced history and live events cover the same ground.
+	st := c.State()
+	cfg := c.opts.Config.Get()
+	c.mu.Lock()
+	known := c.installsKnown
+	c.mu.Unlock()
+	targets, _ := hookTargets(targetInput{
+		orgs: orgs, repos: repos, userLogin: user.Login,
+		userInstalled: st.App.Installed, installsKnown: known, repoHooks: cfg.HookPersonalRepos,
+	})
+
 	src := gh.BackfillSources{Login: user.Login}
+	feedOrgs := map[string]bool{}
 	for _, o := range orgs {
 		if o.Installed {
 			src.Orgs = append(src.Orgs, o.Login)
+			feedOrgs[strings.ToLower(o.Login)] = true
 		}
 	}
-	for _, r := range repos {
-		if r.OwnerIsOrg || r.Archived {
+	for _, t := range targets {
+		if t.Org != "" || feedOrgs[strings.ToLower(t.Owner)] {
 			continue // covered by the org feed
 		}
 		if len(src.Repos) == maxBackfillRepos {
 			break
 		}
-		src.Repos = append(src.Repos, gh.HookTarget{Owner: r.Owner, Repo: r.Name})
+		src.Repos = append(src.Repos, t)
 	}
 	evts, errs := client.Backfill(ctx, src, apiConcurrency)
+	if ctx.Err() != nil {
+		return
+	}
+	if known {
+		evts = inScope(evts, targets)
+	}
+	evts = newest(evts, events.DefaultCapacity)
+	// The Events API has no commit details; fetch them so synced pushes read
+	// like webhook pushes.
+	evts = client.EnrichPushes(ctx, evts, apiConcurrency)
 	if ctx.Err() != nil {
 		return
 	}
@@ -953,4 +977,43 @@ func hookTargets(in targetInput) (targets []gh.HookTarget, skipped []string) {
 		targets = append(targets, gh.HookTarget{Owner: r.Owner, Repo: r.Name})
 	}
 	return targets, skipped
+}
+
+// inScope keeps events from repositories that get webhooks: repo targets
+// directly, and every repository of an org target.
+func inScope(evts []events.Event, targets []gh.HookTarget) []events.Event {
+	orgs, repos := map[string]bool{}, map[string]bool{}
+	for _, t := range targets {
+		if t.Org != "" {
+			orgs[strings.ToLower(t.Org)] = true
+		} else {
+			repos[strings.ToLower(t.Owner+"/"+t.Repo)] = true
+		}
+	}
+	var out []events.Event
+	for _, e := range evts {
+		owner, _, _ := strings.Cut(strings.ToLower(e.Repo), "/")
+		if repos[strings.ToLower(e.Repo)] || orgs[owner] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// newest returns at most n events, newest first, without duplicate keys.
+func newest(evts []events.Event, n int) []events.Event {
+	out := slices.Clone(evts)
+	slices.SortStableFunc(out, func(a, b events.Event) int { return b.Time.Compare(a.Time) })
+	seen := map[string]bool{}
+	out = slices.DeleteFunc(out, func(e events.Event) bool {
+		if seen[e.Key] {
+			return true
+		}
+		seen[e.Key] = true
+		return false
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
 }

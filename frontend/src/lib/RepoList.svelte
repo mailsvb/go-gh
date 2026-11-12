@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { Browser } from "@wailsio/runtime";
   import Icon from "./Icon.svelte";
   import { app } from "./store.svelte";
 
@@ -18,14 +17,6 @@
   <div class="filter">
     <input type="search" placeholder="Filter {app.repos.length} repositories" bind:value={filter} />
   </div>
-  {#if app.state?.app.slug}
-    <p class="note muted">
-      Live events need go-gh installed on the repository's account.
-      <button class="link" onclick={() => app.state && Browser.OpenURL(app.state.app.installUrl)}>
-        {app.state.app.installed ? "Choose repositories" : "Install on your account"}
-      </button>
-    </p>
-  {/if}
   {#if app.state?.reposLoading && app.repos.length === 0}
     <p class="muted empty">Loading repositories…</p>
   {:else if repos.length === 0}
@@ -125,22 +116,6 @@
     line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
-  }
-  .note {
-    margin: 0;
-    padding: 6px 12px;
-    font-size: 12px;
-    border-bottom: 1px solid var(--border);
-  }
-  .link {
-    border: none;
-    background: none;
-    padding: 0;
-    color: var(--accent);
-  }
-  .link:hover {
-    background: none;
-    text-decoration: underline;
   }
   .empty {
     padding: 24px;

@@ -90,13 +90,55 @@ func TestFromPayload(t *testing.T) {
 }
 
 func TestFromPayloadEventsAPIPush(t *testing.T) {
-	// The Events API has no repository/sender in the payload and may omit commits.
-	e, ok := FromPayload(&github.PushEvent{Ref: new("refs/heads/main"), Head: new("def"), Size: new(3)},
+	// The Events API only sends ref, before and head.
+	e, ok := FromPayload(&github.PushEvent{Ref: new("refs/heads/main"), Before: new("abc0123456789abc"), Head: new("def0123456789def")},
 		Context{Source: SourceBackfill, Repo: "octo/app", Actor: "mona", Time: time.Unix(1, 0)})
 	if !ok {
 		t.Fatal("push from Events API was skipped")
 	}
-	if e.Key != "push:octo/app:refs/heads/main:def" || e.Commits != 3 || e.URL != "https://github.com/octo/app/commit/def" {
+	if e.Key != "push:octo/app:refs/heads/main:def0123456789def" || e.Title != "mona pushed to main" || !e.NeedsCommits() ||
+		e.URL != "https://github.com/octo/app/compare/abc012345678...def012345678" {
 		t.Fatalf("got %+v", e)
+	}
+	e.SetCommits(3, "fix it\n\nbody")
+	if e.Title != "mona pushed 3 commits to main" || e.Detail != "fix it" || e.NeedsCommits() {
+		t.Fatalf("after SetCommits: %+v", e)
+	}
+}
+
+// The same push must produce the same entry from both sources once the
+// Events API push has its commit details.
+func TestWebhookAndEventsAPIPushMatch(t *testing.T) {
+	when := time.Unix(100, 0)
+	hook, _ := FromPayload(&github.PushEvent{
+		Ref: new("refs/heads/main"), Before: new("aaaaaaaaaaaaaaaa"), After: new("bbbbbbbbbbbbbbbb"),
+		Repo:       &github.PushEventRepository{FullName: new("octo/app")},
+		Sender:     &github.User{Login: new("mona")},
+		Commits:    []*github.HeadCommit{{Message: new("one")}, {Message: new("two")}},
+		HeadCommit: &github.HeadCommit{Message: new("two")},
+	}, Context{Source: SourceWebhook, Time: when})
+	api, _ := FromPayload(&github.PushEvent{Ref: new("refs/heads/main"), Before: new("aaaaaaaaaaaaaaaa"), Head: new("bbbbbbbbbbbbbbbb")},
+		Context{Source: SourceBackfill, Repo: "octo/app", Actor: "mona", Time: when})
+	api.SetCommits(2, "two")
+	hook.Source, api.Source = "", ""
+	if hook != api {
+		t.Fatalf("webhook %+v\n!= api %+v", hook, api)
+	}
+}
+
+func TestNewBranchPushesAreSkipped(t *testing.T) {
+	zero := "0000000000000000000000000000000000000000"
+	for _, p := range []*github.PushEvent{
+		// webhook: new branch with new commits
+		{Ref: new("refs/heads/feat"), Created: new(true), Before: new(zero), After: new("abc"),
+			Commits: []*github.HeadCommit{{Message: new("x")}}, Repo: &github.PushEventRepository{FullName: new("o/r")}},
+		// Events API: new branch (no created flag, before is zero)
+		{Ref: new("refs/heads/feat"), Before: new(zero), Head: new("abc")},
+		// Events API: deleted branch
+		{Ref: new("refs/heads/feat"), Before: new("abc"), Head: new(zero)},
+	} {
+		if e, ok := FromPayload(p, Context{Repo: "o/r"}); ok {
+			t.Errorf("not skipped: %+v", e)
+		}
 	}
 }
