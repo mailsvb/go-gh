@@ -215,3 +215,42 @@ func TestInstallations(t *testing.T) {
 		t.Error("InstallURL without slug should be empty")
 	}
 }
+
+func TestReposGraphQL(t *testing.T) {
+	var query string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		query = body.Query
+		fmt.Fprint(w, `{"data":{"viewer":{"repositories":{"nodes":[
+			{"nameWithOwner":"acme/api","name":"api","description":"API","openGraphImageUrl":"https://img/1",
+			 "url":"https://github.com/acme/api","isPrivate":true,"isArchived":false,"viewerPermission":"ADMIN",
+			 "owner":{"login":"acme","__typename":"Organization","avatarUrl":"https://av/acme","databaseId":42}},
+			{"nameWithOwner":"mona/x","name":"x","description":"","openGraphImageUrl":"https://img/2",
+			 "url":"https://github.com/mona/x","isPrivate":false,"isArchived":false,"viewerPermission":"WRITE",
+			 "owner":{"login":"mona","__typename":"User","avatarUrl":"https://av/mona","databaseId":7}}],
+			"pageInfo":{"endCursor":"c1","hasNextPage":false}}}}}`)
+	})
+	c := testClient(t, mux)
+	repos, err := c.Repos(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frag := range []string{"... on Organization{databaseId}", "... on User{databaseId}", "openGraphImageUrl"} {
+		if !strings.Contains(query, frag) {
+			t.Errorf("query lacks %q: %s", frag, query)
+		}
+	}
+	if len(repos) != 2 {
+		t.Fatalf("repos = %+v", repos)
+	}
+	if r := repos[0]; r.Owner != "acme" || !r.OwnerIsOrg || r.OwnerID != 42 || r.OwnerAvatar != "https://av/acme" || !r.Admin || r.ImageURL != "https://img/1" {
+		t.Errorf("org repo = %+v", r)
+	}
+	if r := repos[1]; r.OwnerIsOrg || r.OwnerID != 7 || r.Admin {
+		t.Errorf("user repo = %+v", r)
+	}
+}

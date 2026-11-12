@@ -10,6 +10,17 @@
 // @ts-ignore: Unused imports
 import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wailsio/runtime";
 
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore: Unused imports
+import * as core$0 from "../core/models.js";
+
+/**
+ * CheckNotifications re-reads the OS notification permission.
+ */
+export function CheckNotifications(): $CancellablePromise<core$0.NotificationState> {
+    return $Call.ByID(1973402180);
+}
+
 /**
  * ClearNgrokToken removes the ngrok authtoken and stops receiving webhooks.
  */
@@ -36,4 +47,11 @@ export function SetNgrokToken(token: string): $CancellablePromise<void> {
  */
 export function SetOrgEnabled(org: string, enabled: boolean): $CancellablePromise<void> {
     return $Call.ByID(1231703315, org, enabled);
+}
+
+/**
+ * TestNotification shows a sample notification.
+ */
+export function TestNotification(): $CancellablePromise<void> {
+    return $Call.ByID(1283013795);
 }

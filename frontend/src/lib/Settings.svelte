@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Browser } from "@wailsio/runtime";
+  import { onMount } from "svelte";
+  import { Browser, System } from "@wailsio/runtime";
   import { SettingsService } from "../../bindings/go-gh/internal/services";
   import Icon from "./Icon.svelte";
   import { app } from "./store.svelte";
@@ -9,6 +10,25 @@
   let token = $state("");
   let saving = $state(false);
   let err = $state("");
+  let testSent = $state(false);
+
+  // The user may have changed the OS setting since the last check.
+  onMount(() => {
+    SettingsService.CheckNotifications();
+  });
+
+  function openNotificationSettings() {
+    if (System.IsMac()) {
+      Browser.OpenURL("x-apple.systempreferences:com.apple.Notifications-Settings.extension");
+    } else if (System.IsWindows()) {
+      Browser.OpenURL("ms-settings:notifications");
+    }
+  }
+
+  async function testNotification() {
+    await SettingsService.TestNotification();
+    testSent = true;
+  }
 
   const s = $derived(app.state);
   const failed = $derived((s?.hooks.results ?? []).filter((r) => !r.ok));
@@ -113,10 +133,46 @@
     </section>
 
     <section>
+      <h2>Notifications</h2>
+      {#if !s?.notifications.checked}
+        <p class="muted">Checking…</p>
+      {:else if s.notifications.allowed}
+        <p class="muted">System notifications are on.</p>
+      {:else}
+        <p class="error">
+          System notifications are off for go-gh. New events still appear in the Notifications tab.
+        </p>
+        <p class="muted small">
+          Allow notifications for go-gh in your system settings{System.IsMac()
+            ? ". If go-gh is not listed there, macOS rejected the unsigned build"
+            : ""}.
+        </p>
+      {/if}
+      <div class="row">
+        {#if s?.notifications.checked && !s.notifications.allowed}
+          <button class="primary" onclick={openNotificationSettings}>Open notification settings</button>
+          <button onclick={() => SettingsService.CheckNotifications()}>Check again</button>
+        {/if}
+        <button onclick={testNotification}>Send test notification</button>
+      </div>
+      {#if testSent}<p class="muted small">Test sent. If nothing appeared, check the system settings.</p>{/if}
+    </section>
+
+    <section>
       <h2>Webhooks</h2>
       <p class="muted">
-        {s?.hooks.ok ?? 0} active, {s?.hooks.failed ?? 0} failed. Webhooks are deactivated when you quit go-gh.
+        {s?.hooks.ok ?? 0} active, {s?.hooks.failed ?? 0} failed{#if s?.hooks.skipped?.length}, {s.hooks.skipped.length}
+          skipped{/if}. Webhooks are deactivated when you quit go-gh.
       </p>
+      {#if s?.hooks.skipped?.length}
+        <details>
+          <summary class="muted">{s.hooks.skipped.length} skipped: go-gh is not installed on their account</summary>
+          <ul class="fails">
+            {#each s.hooks.skipped as r}<li class="muted small">{r}</li>{/each}
+          </ul>
+          <p class="muted small">Install go-gh on the organization below to receive their events.</p>
+        </details>
+      {/if}
       <label class="check">
         <input
           type="checkbox"
@@ -144,7 +200,7 @@
     <section>
       <h2>Organizations</h2>
       {#if !s?.orgs?.length}
-        <p class="muted">You are not a member of any organization.</p>
+        <p class="muted">No organizations found.</p>
       {:else}
         <ul class="orgs">
           {#each s.orgs as o (o.login)}
@@ -154,7 +210,13 @@
                 <strong>{o.login}</strong>
                 <span class="muted small">
                   {#if !o.installed}
-                    go-gh is not installed{o.owner ? "" : ". Ask an owner, or request it"}
+                    {#if !o.roleKnown}
+                      go-gh is not installed. Owners can install it, members can request it
+                    {:else if o.owner}
+                      go-gh is not installed. You can install it as an owner
+                    {:else}
+                      go-gh is not installed. Request it from an owner
+                    {/if}
                   {:else if o.owner}
                     {o.hooked ? "Organization webhook active" : o.enabled ? "Organization webhook pending" : "Organization webhook off"}
                   {:else}
@@ -171,7 +233,7 @@
                 {/if}
                 {#if o.installUrl}
                   <button onclick={() => Browser.OpenURL(o.installUrl)}>
-                    {o.installed ? "Repositories" : o.owner ? "Install" : "Request"}
+                    {o.installed ? "Repositories" : !o.roleKnown ? "Install or request" : o.owner ? "Install" : "Request"}
                   </button>
                 {/if}
                 {#if o.owner && o.installed}
@@ -187,8 +249,9 @@
           {/each}
         </ul>
         <p class="muted small">
-          Organization owners install go-gh and choose its repositories. Members can request the installation, and an
-          owner approves it on GitHub. Click Refresh after installing.
+          Installing happens on GitHub: owners install go-gh and choose its repositories, members send a request that an
+          owner approves. Enterprise policies can block third-party apps. go-gh picks up the change when you open it
+          again.
         </p>
       {/if}
     </section>

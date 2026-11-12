@@ -10,6 +10,8 @@ import (
 type Repo struct {
 	NameWithOwner string `json:"nameWithOwner"`
 	Owner         string `json:"owner"`
+	OwnerID       int64  `json:"ownerId"`
+	OwnerAvatar   string `json:"ownerAvatar"`
 	OwnerIsOrg    bool   `json:"ownerIsOrg"`
 	Name          string `json:"name"`
 	Description   string `json:"description"`
@@ -30,8 +32,15 @@ type repoNode struct {
 	IsArchived        bool
 	ViewerPermission  githubv4.RepositoryPermission
 	Owner             struct {
-		Login    string
-		Typename string `graphql:"__typename"`
+		Login        string
+		Typename     string       `graphql:"__typename"`
+		AvatarURL    githubv4.URI `graphql:"avatarUrl"`
+		Organization struct {
+			DatabaseID int64 `graphql:"databaseId"`
+		} `graphql:"... on Organization"`
+		User struct {
+			DatabaseID int64 `graphql:"databaseId"`
+		} `graphql:"... on User"`
 	}
 }
 
@@ -67,6 +76,7 @@ func (c *Client) Repos(ctx context.Context) ([]Repo, error) {
 				NameWithOwner: n.NameWithOwner,
 				Owner:         n.Owner.Login,
 				OwnerIsOrg:    n.Owner.Typename == "Organization",
+				OwnerID:       max(n.Owner.Organization.DatabaseID, n.Owner.User.DatabaseID),
 				Name:          n.Name,
 				Description:   n.Description,
 				Private:       n.IsPrivate,
@@ -75,6 +85,9 @@ func (c *Client) Repos(ctx context.Context) ([]Repo, error) {
 			}
 			if n.OpenGraphImageURL.URL != nil {
 				r.ImageURL = n.OpenGraphImageURL.String()
+			}
+			if n.Owner.AvatarURL.URL != nil {
+				r.OwnerAvatar = n.Owner.AvatarURL.String()
 			}
 			if n.URL.URL != nil {
 				r.URL = n.URL.String()

@@ -6,6 +6,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"golang.org/x/oauth2"
 	"log/slog"
 	"slices"
@@ -81,33 +82,46 @@ type AppState struct {
 
 // HookSummary aggregates webhook results.
 type HookSummary struct {
-	OK      int             `json:"ok"`
-	Failed  int             `json:"failed"`
+	OK     int `json:"ok"`
+	Failed int `json:"failed"`
+	// Skipped repositories belong to accounts where the GitHub App is not
+	// installed (e.g. public repos of other orgs); hooks there would fail.
+	Skipped []string        `json:"skipped"`
 	Results []gh.HookResult `json:"results"`
+}
+
+// NotificationState is the OS permission for notifications.
+type NotificationState struct {
+	Checked bool   `json:"checked"`
+	Allowed bool   `json:"allowed"`
+	Error   string `json:"error"`
 }
 
 // State is everything the UI needs to render chrome and status.
 type State struct {
-	Phase             Phase            `json:"phase"`
-	User              *gh.User         `json:"user"`
-	App               AppState         `json:"app"`
-	DeviceCode        *auth.DeviceCode `json:"deviceCode"`
-	ClientIDSet       bool             `json:"clientIdSet"`
-	NgrokSet          bool             `json:"ngrokSet"`
-	HookPersonalRepos bool             `json:"hookPersonalRepos"`
-	Tunnel            TunnelState      `json:"tunnel"`
-	Hooks             HookSummary      `json:"hooks"`
-	Orgs              []OrgState       `json:"orgs"`
-	ReposLoading      bool             `json:"reposLoading"`
-	BackfillErrors    []string         `json:"backfillErrors"`
-	Error             string           `json:"error"`
+	Phase             Phase             `json:"phase"`
+	User              *gh.User          `json:"user"`
+	App               AppState          `json:"app"`
+	DeviceCode        *auth.DeviceCode  `json:"deviceCode"`
+	ClientIDSet       bool              `json:"clientIdSet"`
+	NgrokSet          bool              `json:"ngrokSet"`
+	HookPersonalRepos bool              `json:"hookPersonalRepos"`
+	Tunnel            TunnelState       `json:"tunnel"`
+	Hooks             HookSummary       `json:"hooks"`
+	Orgs              []OrgState        `json:"orgs"`
+	ReposLoading      bool              `json:"reposLoading"`
+	BackfillErrors    []string          `json:"backfillErrors"`
+	Notifications     NotificationState `json:"notifications"`
+	Error             string            `json:"error"`
 	// CanRetry is set when a stored session exists but GitHub was unreachable.
 	CanRetry bool `json:"canRetry"`
 }
 
-// Notifier shows an OS notification for a live event.
+// Notifier shows OS notifications for live events.
 type Notifier interface {
 	Notify(e events.Event)
+	// Allowed reports whether the OS lets the app show notifications.
+	Allowed() (bool, error)
 }
 
 // Emitter sends an event to the frontend.
@@ -130,15 +144,19 @@ type Core struct {
 	log   *slog.Logger
 	store *events.Store
 
-	mu       sync.Mutex
-	state    State
-	client   *gh.Client
-	repos    []gh.Repo
-	tun      *tunnel.Tunnel
-	session  context.Context // cancelled on logout/shutdown
-	cancel   context.CancelFunc
-	login    context.CancelFunc
-	hookRuns sync.Mutex // serializes EnsureHooks/Deactivate
+	mu     sync.Mutex
+	state  State
+	client *gh.Client
+	repos  []gh.Repo
+	// installsKnown is false when listing app installations failed; hooks
+	// are then attempted everywhere instead of being filtered.
+	installsKnown bool
+	lastRefresh   time.Time
+	tun           *tunnel.Tunnel
+	session       context.Context // cancelled on logout/shutdown
+	cancel        context.CancelFunc
+	login         context.CancelFunc
+	hookRuns      sync.Mutex // serializes EnsureHooks/Deactivate
 }
 
 // New creates a Core. Call Start once the UI is up.
@@ -170,6 +188,7 @@ func (c *Core) snapshotLocked() State {
 	s := c.state
 	s.Orgs = slices.Clone(s.Orgs)
 	s.Hooks.Results = slices.Clone(s.Hooks.Results)
+	s.Hooks.Skipped = slices.Clone(s.Hooks.Skipped)
 	s.BackfillErrors = slices.Clone(s.BackfillErrors)
 	cfg := c.opts.Config.Get()
 	s.HookPersonalRepos = cfg.HookPersonalRepos
@@ -361,18 +380,28 @@ func (c *Core) Refresh() {
 }
 
 func (c *Core) refresh(ctx context.Context, client *gh.Client, user gh.User) {
+	c.mu.Lock()
+	c.lastRefresh = time.Now()
+	c.mu.Unlock()
 	c.update(func(s *State) { s.ReposLoading = true })
 
 	var (
-		orgs     []gh.Org
-		repos    []gh.Repo
-		insts    []gh.Installation
-		orgErr   error
-		reposErr error
-		instErr  error
-		wg       sync.WaitGroup
+		orgs       []gh.Org
+		publicOrgs []gh.Org
+		repos      []gh.Repo
+		insts      []gh.Installation
+		orgErr     error
+		reposErr   error
+		instErr    error
+		wg         sync.WaitGroup
 	)
 	wg.Go(func() { orgs, orgErr = client.Orgs(ctx) })
+	wg.Go(func() {
+		var err error
+		if publicOrgs, err = client.PublicOrgs(ctx, user.Login); err != nil {
+			c.log.Warn("listing public organizations", "err", err)
+		}
+	})
 	wg.Go(func() { repos, reposErr = client.Repos(ctx) })
 	wg.Go(func() { insts, instErr = client.Installations(ctx) })
 	wg.Wait()
@@ -383,13 +412,20 @@ func (c *Core) refresh(ctx context.Context, client *gh.Client, user gh.User) {
 	c.mu.Lock()
 	if reposErr == nil {
 		c.repos = repos
+	} else {
+		repos = c.repos // keep the last good list
 	}
 	c.mu.Unlock()
 	if reposErr == nil {
 		c.opts.Emit(EvtRepos, repos)
 	}
 
-	app, orgStates := c.installState(user, orgs, insts)
+	app, orgStates := c.installState(user, orgSources{
+		members: orgs, public: publicOrgs, repos: repos, installs: insts,
+	})
+	c.mu.Lock()
+	c.installsKnown = instErr == nil
+	c.mu.Unlock()
 	c.update(func(s *State) {
 		s.ReposLoading = false
 		s.Orgs = orgStates
@@ -411,10 +447,21 @@ func (c *Core) refresh(ctx context.Context, client *gh.Client, user gh.User) {
 	c.ensureTunnelAndHooks(ctx, client)
 }
 
-// installState combines memberships and app installations.
-func (c *Core) installState(user gh.User, orgs []gh.Org, insts []gh.Installation) (AppState, []OrgState) {
+// orgSources are the places organizations are learned from. With a GitHub
+// App token the membership list only contains organizations where the app is
+// installed, so the others come from public memberships, the owners of the
+// user's repositories and the installations themselves.
+type orgSources struct {
+	members  []gh.Org // role known
+	public   []gh.Org
+	repos    []gh.Repo
+	installs []gh.Installation
+}
+
+// installState combines the organization sources with app installations.
+func (c *Core) installState(user gh.User, src orgSources) (AppState, []OrgState) {
 	byAccount := map[string]gh.Installation{}
-	for _, i := range insts {
+	for _, i := range src.installs {
 		if !i.Suspended {
 			byAccount[strings.ToLower(i.Account)] = i
 		}
@@ -424,6 +471,46 @@ func (c *Core) installState(user gh.User, orgs []gh.Org, insts []gh.Installation
 		app.Installed, app.Selection, app.InstallURL = true, i.Selection, i.URL
 	} else {
 		app.InstallURL = gh.InstallURL(c.opts.AppSlug, user.ID)
+	}
+
+	// Merge, preferring the source with the most information (memberships).
+	orgs := map[string]gh.Org{}
+	add := func(o gh.Org) {
+		k := strings.ToLower(o.Login)
+		if k == "" || k == strings.ToLower(user.Login) {
+			return
+		}
+		cur, ok := orgs[k]
+		switch {
+		case !ok:
+			orgs[k] = o
+		case o.RoleKnown && !cur.RoleKnown:
+			orgs[k] = o
+		default:
+			if cur.ID == 0 {
+				cur.ID = o.ID
+			}
+			if cur.AvatarURL == "" {
+				cur.AvatarURL = o.AvatarURL
+			}
+			orgs[k] = cur
+		}
+	}
+	for _, o := range src.members {
+		add(o)
+	}
+	for _, o := range src.public {
+		add(o)
+	}
+	for _, r := range src.repos {
+		if r.OwnerIsOrg {
+			add(gh.Org{ID: r.OwnerID, Login: r.Owner, AvatarURL: r.OwnerAvatar})
+		}
+	}
+	for _, i := range src.installs {
+		if i.IsOrg {
+			add(gh.Org{ID: i.AccountID, Login: i.Account, AvatarURL: i.Avatar})
+		}
 	}
 
 	cfg := c.opts.Config.Get()
@@ -436,6 +523,16 @@ func (c *Core) installState(user gh.User, orgs []gh.Org, insts []gh.Installation
 		st.Enabled = o.Owner && st.Installed && !slices.Contains(cfg.DisabledOrgs, o.Login)
 		out = append(out, st)
 	}
+	// Installed first, then alphabetically.
+	slices.SortFunc(out, func(a, b OrgState) int {
+		if a.Installed != b.Installed {
+			if a.Installed {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(strings.ToLower(a.Login), strings.ToLower(b.Login))
+	})
 	return app, out
 }
 
@@ -510,10 +607,11 @@ func (c *Core) ensureTunnelAndHooks(ctx context.Context, client *gh.Client) {
 			OnEvent: c.onWebhookEvent,
 			Log:     c.log,
 		}
-		tctx, tcancel := context.WithTimeout(ctx, 30*time.Second)
-		tun, err = tunnel.Start(tctx, ngrokTok, h)
-		tcancel()
+		// The tunnel lives as long as the session (ctx); tunnel.Start applies
+		// its own connect timeout.
+		tun, err = tunnel.Start(ctx, ngrokTok, h)
 		if err != nil {
+			c.log.Error("ngrok tunnel failed to start", "err", err)
 			c.update(func(s *State) { s.Tunnel = TunnelState{Status: "error", Error: err.Error()} })
 			c.retryTunnel(ctx, client)
 			return
@@ -527,6 +625,7 @@ func (c *Core) ensureTunnelAndHooks(ctx context.Context, client *gh.Client) {
 		c.tun = tun
 		c.mu.Unlock()
 		go c.watchTunnel(ctx, client, tun)
+		c.log.Info("ngrok tunnel online", "url", tun.URL())
 		c.update(func(s *State) { s.Tunnel = TunnelState{Status: "online", URL: tun.URL()} })
 	}
 
@@ -542,26 +641,20 @@ func (c *Core) ensureHooks(ctx context.Context, client *gh.Client, spec gh.HookS
 	cfg := c.opts.Config.Get()
 
 	c.mu.Lock()
-	orgs := slices.Clone(c.state.Orgs)
-	repos := slices.Clone(c.repos)
+	in := targetInput{
+		orgs:          slices.Clone(c.state.Orgs),
+		repos:         slices.Clone(c.repos),
+		installsKnown: c.installsKnown,
+		userInstalled: c.state.App.Installed,
+		repoHooks:     cfg.HookPersonalRepos,
+	}
+	if c.state.User != nil {
+		in.userLogin = c.state.User.Login
+	}
 	previous := slices.Clone(c.state.Hooks.Results)
 	c.mu.Unlock()
 
-	var targets []gh.HookTarget
-	orgHooked := map[string]bool{}
-	for _, o := range orgs {
-		if o.Enabled {
-			targets = append(targets, gh.HookTarget{Org: o.Login})
-			orgHooked[o.Login] = true
-		}
-	}
-	if cfg.HookPersonalRepos {
-		for _, r := range repos {
-			if r.Admin && !r.Archived && !(r.OwnerIsOrg && orgHooked[r.Owner]) {
-				targets = append(targets, gh.HookTarget{Owner: r.Owner, Repo: r.Name})
-			}
-		}
-	}
+	targets, skipped := hookTargets(in)
 
 	// Deactivate hooks we no longer want (org disabled, personal repos off).
 	var stale []gh.HookResult
@@ -575,10 +668,21 @@ func (c *Core) ensureHooks(ctx context.Context, client *gh.Client, spec gh.HookS
 	}
 
 	results := client.EnsureHooks(ctx, spec, targets, apiConcurrency)
+	failed := 0
+	for _, r := range results {
+		if !r.OK {
+			failed++
+			c.log.Warn("webhook failed", "target", r.Target.String(), "problem", r.Problem, "err", r.Error)
+		}
+	}
+	c.log.Info("webhooks applied", "ok", len(results)-failed, "failed", failed, "url", spec.PublicURL)
 	if ctx.Err() != nil {
 		return
 	}
-	sum := HookSummary{Results: results}
+	if len(skipped) > 0 {
+		c.log.Info("skipped webhooks where go-gh is not installed", "repos", skipped)
+	}
+	sum := HookSummary{Results: results, Skipped: skipped}
 	for _, r := range results {
 		if r.OK {
 			sum.OK++
@@ -617,6 +721,7 @@ func (c *Core) watchTunnel(ctx context.Context, client *gh.Client, tun *tunnel.T
 		if err != nil {
 			msg = err.Error()
 		}
+		c.log.Error("ngrok tunnel stopped", "err", msg)
 		c.update(func(s *State) { s.Tunnel = TunnelState{Status: "error", Error: msg} })
 		c.retryTunnel(ctx, client)
 	}
@@ -738,6 +843,17 @@ func (c *Core) reapplyHooks() {
 	go c.ensureHooks(ctx, client, gh.HookSpec{InstallID: cfg.InstallID, PublicURL: tun.URL(), Secret: secret})
 }
 
+// RefreshIfStale refreshes when the last refresh is older than maxAge, e.g.
+// when the window opens after the user installed the app on GitHub.
+func (c *Core) RefreshIfStale(maxAge time.Duration) {
+	c.mu.Lock()
+	stale := time.Since(c.lastRefresh) > maxAge
+	c.mu.Unlock()
+	if stale {
+		c.Refresh()
+	}
+}
+
 // OnWake refreshes the history after the system resumed from sleep.
 func (c *Core) OnWake() { c.Refresh() }
 
@@ -762,4 +878,79 @@ func (c *Core) saveToken(t *oauth2.Token) {
 	if err != nil {
 		c.log.Warn("saving token to keychain", "err", err)
 	}
+}
+
+// CheckNotifications re-reads the OS notification permission (e.g. after the
+// user changed it in the system settings).
+func (c *Core) CheckNotifications() NotificationState {
+	if c.opts.Notifier == nil {
+		return NotificationState{}
+	}
+	ok, err := c.opts.Notifier.Allowed()
+	st := NotificationState{Checked: true, Allowed: ok && err == nil}
+	if err != nil {
+		st.Error = err.Error()
+	}
+	c.update(func(s *State) { s.Notifications = st })
+	return st
+}
+
+// TestNotification shows a sample notification.
+func (c *Core) TestNotification() {
+	if c.opts.Notifier == nil {
+		return
+	}
+	c.opts.Notifier.Notify(events.Event{
+		Key:    fmt.Sprintf("test:%d", time.Now().UnixNano()),
+		Kind:   events.KindRelease,
+		Repo:   "go-gh",
+		Title:  "Notifications are working",
+		Detail: "New pushes, tags, branches and releases will show up like this.",
+		URL:    "https://github.com/notifications",
+		Time:   time.Now(),
+	})
+}
+
+type targetInput struct {
+	orgs          []OrgState
+	repos         []gh.Repo
+	userLogin     string
+	userInstalled bool
+	installsKnown bool
+	repoHooks     bool // per-repository hooks enabled
+}
+
+// hookTargets decides where webhooks go: one org hook per enabled org, plus
+// a repo hook for every administered, non-archived repo that is not covered
+// by an org hook. Repos on accounts without the GitHub App installed (public
+// repos of other orgs) are skipped, because GitHub rejects hooks there.
+func hookTargets(in targetInput) (targets []gh.HookTarget, skipped []string) {
+	installed := map[string]bool{}
+	if in.userInstalled && in.userLogin != "" {
+		installed[strings.ToLower(in.userLogin)] = true
+	}
+	orgHooked := map[string]bool{}
+	for _, o := range in.orgs {
+		if o.Installed {
+			installed[strings.ToLower(o.Login)] = true
+		}
+		if o.Enabled {
+			targets = append(targets, gh.HookTarget{Org: o.Login})
+			orgHooked[o.Login] = true
+		}
+	}
+	if !in.repoHooks {
+		return targets, nil
+	}
+	for _, r := range in.repos {
+		if !r.Admin || r.Archived || (r.OwnerIsOrg && orgHooked[r.Owner]) {
+			continue
+		}
+		if in.installsKnown && !installed[strings.ToLower(r.Owner)] {
+			skipped = append(skipped, r.NameWithOwner)
+			continue
+		}
+		targets = append(targets, gh.HookTarget{Owner: r.Owner, Repo: r.Name})
+	}
+	return targets, skipped
 }

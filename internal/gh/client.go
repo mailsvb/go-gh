@@ -53,7 +53,11 @@ func newWithBase(src oauth2.TokenSource, base http.RoundTripper, apiURL string) 
 	if err != nil {
 		return nil, err
 	}
-	return &Client{REST: rest, GraphQL: githubv4.NewClient(hc), http: hc}, nil
+	gql := githubv4.NewClient(hc)
+	if apiURL != "" {
+		gql = githubv4.NewEnterpriseClient(apiURL+"graphql", hc)
+	}
+	return &Client{REST: rest, GraphQL: gql, http: hc}, nil
 }
 
 // User is the authenticated user shown in the header.

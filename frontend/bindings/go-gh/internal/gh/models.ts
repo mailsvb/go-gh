@@ -57,6 +57,8 @@ export interface HookTarget {
 export interface Repo {
     "nameWithOwner": string;
     "owner": string;
+    "ownerId": number;
+    "ownerAvatar": string;
     "ownerIsOrg": boolean;
     "name": string;
     "description": string;

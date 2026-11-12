@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -110,6 +111,11 @@ func main() {
 			HiddenOnTaskbar: true,
 		},
 	})
+	// Pick up changes made on GitHub (e.g. a new installation) when the
+	// popup opens, at most once a minute.
+	window.OnWindowEvent(events.Common.WindowShow, func(*application.WindowEvent) {
+		c.RefreshIfStale(time.Minute)
+	})
 	// Closing the popup only hides it; the app keeps running in the tray.
 	window.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
 		window.Hide()
@@ -156,9 +162,12 @@ func main() {
 	})
 
 	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
+		// Shows the OS permission prompt the first time; afterwards it only
+		// reports the current setting.
 		if ok, err := ns.RequestNotificationAuthorization(); err != nil || !ok {
 			slog.Warn("notifications not authorized", "err", err)
 		}
+		c.CheckNotifications()
 		c.Start()
 	})
 	app.Event.OnApplicationEvent(events.Common.SystemDidWake, func(*application.ApplicationEvent) {
@@ -198,6 +207,8 @@ func statusLabel(s core.State) string {
 type notifier struct {
 	ns *notifications.NotificationService
 }
+
+func (n notifier) Allowed() (bool, error) { return n.ns.CheckNotificationAuthorization() }
 
 func (n notifier) Notify(e appevents.Event) {
 	body := e.Title

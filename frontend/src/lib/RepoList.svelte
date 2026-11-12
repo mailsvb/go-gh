@@ -20,7 +20,7 @@
   </div>
   {#if app.state?.app.slug}
     <p class="note muted">
-      Showing repositories where go-gh is installed.
+      Live events need go-gh installed on the repository's account.
       <button class="link" onclick={() => app.state && Browser.OpenURL(app.state.app.installUrl)}>
         {app.state.app.installed ? "Choose repositories" : "Install on your account"}
       </button>

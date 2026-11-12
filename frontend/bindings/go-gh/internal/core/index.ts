@@ -8,6 +8,7 @@ export {
 export type {
     AppState,
     HookSummary,
+    NotificationState,
     OrgState,
     State,
     TunnelState

@@ -60,3 +60,11 @@ func (s *SettingsService) SetOrgEnabled(org string, enabled bool) error {
 func (s *SettingsService) SetHookPersonalRepos(on bool) error {
 	return s.Core.SetHookPersonalRepos(on)
 }
+
+// CheckNotifications re-reads the OS notification permission.
+func (s *SettingsService) CheckNotifications() core.NotificationState {
+	return s.Core.CheckNotifications()
+}
+
+// TestNotification shows a sample notification.
+func (s *SettingsService) TestNotification() { s.Core.TestNotification() }

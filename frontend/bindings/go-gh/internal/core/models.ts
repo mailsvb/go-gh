@@ -46,7 +46,22 @@ export interface AppState {
 export interface HookSummary {
     "ok": number;
     "failed": number;
+
+    /**
+     * Skipped repositories belong to accounts where the GitHub App is not
+     * installed (e.g. public repos of other orgs); hooks there would fail.
+     */
+    "skipped": string[] | null;
     "results": gh$0.HookResult[] | null;
+}
+
+/**
+ * NotificationState is the OS permission for notifications.
+ */
+export interface NotificationState {
+    "checked": boolean;
+    "allowed": boolean;
+    "error": string;
 }
 
 /**
@@ -61,6 +76,12 @@ export interface OrgState {
      * role "admin": may manage org webhooks
      */
     "owner": boolean;
+
+    /**
+     * RoleKnown is false for organizations found only through public data or
+     * repository owners, where GitHub doesn't reveal the user's role.
+     */
+    "roleKnown": boolean;
 
     /**
      * the GitHub App is installed on the org
@@ -122,6 +143,7 @@ export interface State {
     "orgs": OrgState[] | null;
     "reposLoading": boolean;
     "backfillErrors": string[] | null;
+    "notifications": NotificationState;
     "error": string;
 
     /**

@@ -13,6 +13,7 @@ type Installation struct {
 	// Account is the user or organization login the app is installed on.
 	Account   string `json:"account"`
 	AccountID int64  `json:"accountId"`
+	Avatar    string `json:"avatar"`
 	IsOrg     bool   `json:"isOrg"`
 	// Selection is "all" or "selected" repositories.
 	Selection string `json:"selection"`
@@ -37,6 +38,7 @@ func (c *Client) Installations(ctx context.Context) ([]Installation, error) {
 				ID:        i.GetID(),
 				Account:   a.GetLogin(),
 				AccountID: a.GetID(),
+				Avatar:    a.GetAvatarURL(),
 				IsOrg:     i.GetTargetType() == "Organization",
 				Selection: i.GetRepositorySelection(),
 				URL:       i.GetHTMLURL(),
